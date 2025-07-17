@@ -2,7 +2,7 @@ python-telegram-bot==20.0
 google-api-python-client==2.0.2
 google-auth-httplib2==0.1.0
 google-auth-oauthlib==0.4.6
-cryptography==41.0.5
+cryptography==44.0.1
 python-dotenv==0.19.2
 setuptools<81
 reportlab>=3.6.0

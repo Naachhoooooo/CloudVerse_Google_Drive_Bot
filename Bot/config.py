@@ -7,10 +7,9 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
-TeamCloudverse_TOPIC_ID = os.getenv("TeamCloudverse_TOPIC_ID")  # Renamed from AdminControl_TOPIC_ID
+TeamCloudverse_TOPIC_ID = os.getenv("TeamCloudverse_TOPIC_ID")
 MessageDev_TOPIC_ID = os.getenv("MessageDev_TOPIC_ID")
-SUPER_ADMIN_ID = os.getenv("SUPER_ADMIN_ID")  # Super admin Telegram ID
-ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
+SUPER_ADMIN_ID = os.getenv("SUPER_ADMIN_ID")
 if not ENCRYPTION_KEY:
     raise ValueError("ENCRYPTION_KEY is not set in config.")
 

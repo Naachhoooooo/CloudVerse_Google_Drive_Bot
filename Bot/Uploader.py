@@ -6,75 +6,48 @@ import requests
 from datetime import datetime
 from googleapiclient.http import MediaFileUpload
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from .Utilities import format_size, is_url
-from .Logger import log_upload, log_bandwidth, log_error, get_logger
 from .drive import get_drive_service, get_storage_info
 from mimetypes import guess_extension
 from telegram.ext import ContextTypes
 import json
-import websockets
 import math
 from telethon import TelegramClient
 from telethon.tl.types import InputDocument
 from .config import TELETHON_API_ID, TELETHON_API_HASH
-from .database import insert_upload, get_upload_by_file_id
+from .database import insert_upload, get_upload_by_file_id, get_user_default_folder_id
 import subprocess
 import shlex
+from .Utilities import format_size, is_url, handle_errors, get_adaptive_chunk_size, is_streaming_site, is_direct_file_url
 
-logger = get_logger()
+# Message constants (user-facing)
+COULD_NOT_FIND_MESSAGE_ID_OR_CHAT_ID_MSG = '❌ Could not find message_id or chat_id for this file. Large file download not possible.'
+COULD_NOT_FIND_ORIGINAL_MESSAGE_MSG = '❌ Could not find the original message for this file. Large file download not possible.'
+TELETHON_DOWNLOAD_FAILED_MSG = '❌ Telethon download failed: {error}'
+PREPARING_UPLOAD = 'Preparing upload...'
+INSUFFICIENT_STORAGE_MSG = 'Insufficient storage. Only {free_space:.2f} GB free. File size: {file_size}.'
+UPLOADING_TO_FOLDER_MSG = 'Uploading to folder: {folder_name}'
+UPLOADING_TO_DEFAULT_LOCATION_MSG = 'Uploading to default location.'
+PREPARING_URL_UPLOAD = 'Preparing URL upload...'
+CANCELLING_UPLOAD = 'Cancelling upload...'
+UPLOAD_CANCELLED_MSG = 'Upload cancelled.'
+DOWNLOAD_FAILED_OR_NOT_FOUND_MSG = '❌ Download failed or file not found.'
+UPLOAD_COMPLETE_MSG = 'Upload complete! {file_name} is now in your Google Drive.'
+UPLOAD_SUCCESS_MSG = 'Upload successful: {file_name} in {location}.'
+UPLOAD_FAILED_MSG = '❌ Upload to Google Drive failed: {error}'
+DOWNLOAD_FAILED_MSG = '❌ Download failed: {error}'
 
-class ProgressWebSocketClient:
-    def __init__(self, url):
-        self.url = url
-        self.ws = None
-        self.lock = asyncio.Lock()
-        self.connected = False
-        self.connecting = False
-
-    async def connect(self):
-        if self.connected or self.connecting:
-            return
-        self.connecting = True
-        try:
-            self.ws = await websockets.connect(self.url)
-            self.connected = True
-        except Exception:
-            self.ws = None
-            self.connected = False
-        finally:
-            self.connecting = False
-
-    async def send(self, data):
-        async with self.lock:
-            if not self.connected:
-                await self.connect()
-            if self.ws and self.connected:
-                try:
-                    await self.ws.send(json.dumps(data))
-                except Exception:
-                    self.connected = False
-                    self.ws = None
-
-progress_ws_client = ProgressWebSocketClient('ws://localhost:8770')
-
-async def send_progress_update(progress_data):
-    await progress_ws_client.send({
-        'type': 'upload_progress',
-        'upload': progress_data
-    })
-
-async def download_file_telethon(telegram_id, file_id, file_size, file_name, update=None):
+async def download_from_telegram(telegram_id, file_id, file_size, file_name, update=None):
     if TELETHON_API_ID is None or TELETHON_API_HASH is None:
         raise ValueError("TELETHON_API_ID and TELETHON_API_HASH must be set in the environment.")
     session_name = f"telethon_{telegram_id}"
     client = TelegramClient(session_name, int(TELETHON_API_ID), str(TELETHON_API_HASH))
-    await client.start()
+    client.start()
     # Fetch upload metadata
     upload = get_upload_by_file_id(file_id)
     if not upload or not upload['message_id'] or not upload['chat_id']:
         if update:
-            await update.message.reply_text('❌ Could not find message_id or chat_id for this file. Large file download not possible.')
-        await client.disconnect()
+            await update.message.reply_text(COULD_NOT_FIND_MESSAGE_ID_OR_CHAT_ID_MSG)
+        client.disconnect()
         return None
     message_id = upload['message_id']
     chat_id = upload['chat_id']
@@ -88,8 +61,8 @@ async def download_file_telethon(telegram_id, file_id, file_size, file_name, upd
             msg = msg[0] if msg else None
         if not msg:
             if update:
-                await update.message.reply_text('❌ Could not find the original message for this file. Large file download not possible.')
-            await client.disconnect()
+                await update.message.reply_text(COULD_NOT_FIND_ORIGINAL_MESSAGE_MSG)
+            client.disconnect()
             return None
         last_percent = -1
         def progress_callback(current, total):
@@ -103,29 +76,14 @@ async def download_file_telethon(telegram_id, file_id, file_size, file_name, upd
         await client.download_media(msg, file=temp_file_path, progress_callback=progress_callback)
     except Exception as e:
         if update:
-            await update.message.reply_text(f'❌ Telethon download failed: {e}')
-        await client.disconnect()
+            await update.message.reply_text(TELETHON_DOWNLOAD_FAILED_MSG.format(error=e))
+        client.disconnect()
         return None
-    await client.disconnect()
+    client.disconnect()
     return temp_file_path
 
-def get_adaptive_chunk_size(last_chunk_time, current_chunk_size, logger=None, context=None):
-    min_chunk = 64 * 1024      # 64KB
-    max_chunk = 8 * 1024 * 1024 # 8MB
-    reason = 'unchanged'
-    new_chunk = current_chunk_size
-    if last_chunk_time < 0.5:
-        new_chunk = min(current_chunk_size * 2, max_chunk)
-        reason = 'fast'
-    elif last_chunk_time > 2.0:
-        new_chunk = max(current_chunk_size // 2, min_chunk)
-        reason = 'slow'
-    if logger is not None and new_chunk != current_chunk_size:
-        logger.info(f"[ChunkSize] {context or ''} Chunk size changed from {current_chunk_size} to {new_chunk} due to {reason} chunk (time: {last_chunk_time:.2f}s)")
-    return new_chunk
-
+@handle_errors
 async def handle_file_upload(update, ctx):
-    """Handle file upload from user, including error handling and logging."""
     telegram_id = None
     preparing_message = None
     temp_file_path = None
@@ -137,7 +95,6 @@ async def handle_file_upload(update, ctx):
         elif update.callback_query and update.callback_query.from_user:
             telegram_id = update.callback_query.from_user.id
         else:
-            logger.warning("handle_file_upload called without user context")
             return
         if update.message and update.message.document:
             file = update.message.document
@@ -161,8 +118,12 @@ async def handle_file_upload(update, ctx):
                 account_data = {}
             parent_id = account_data.get("current_folder", "root")
         else:
-            parent_id = "root"
-            current_account = "default_account"
+            current_account = ctx.user_data.get("current_account", "default_account")
+            # Try user_data first, then fallback to DB if needed
+            default_folder_id = ctx.user_data.get("default_folder_id")
+            if not default_folder_id:
+                default_folder_id = get_user_default_folder_id(telegram_id, current_account) or "root"
+            parent_id = default_folder_id
         service = get_drive_service(telegram_id, current_account)
         storage = get_storage_info(service)
         limit = int(storage["storageQuota"]["limit"]) if storage and "storageQuota" in storage and "limit" in storage["storageQuota"] else 0
@@ -174,7 +135,7 @@ async def handle_file_upload(update, ctx):
                 await update.message.reply_text(warning_low_space(free_space, percent_free))
         if file_size_gb > free_space:
             preparing_message = await update.message.reply_text(PREPARING_UPLOAD)
-            await preparing_message.edit_text(insufficient_storage(free_space, format_size(file_size_bytes)))
+            await preparing_message.edit_text(INSUFFICIENT_STORAGE_MSG.format(free_space=free_space, file_size=format_size(file_size_bytes)))
             return
         folder_name = None
         try:
@@ -184,10 +145,10 @@ async def handle_file_upload(update, ctx):
         except Exception:
             folder_name = None
         if folder_name:
-            upload_location_str = UPLOADING_TO_FOLDER(folder_name)
+            upload_location_str = UPLOADING_TO_FOLDER_MSG.format(folder_name=folder_name)
             await update.message.reply_text(upload_location_str)
         else:
-            upload_location_str = UPLOADING_TO_DEFAULT_LOCATION
+            upload_location_str = UPLOADING_TO_DEFAULT_LOCATION_MSG
             await update.message.reply_text(upload_location_str)
         try:
             if update.message and update.message.document and hasattr(update.message.document, 'file_id'):
@@ -204,7 +165,7 @@ async def handle_file_upload(update, ctx):
                 ])
                 preparing_message = await update.message.reply_text(PREPARING_UPLOAD)
                 await preparing_message.edit_text(
-                    f"Downloading from Telegram...\n{upload_location_str}\nProgress: 0% [🟡🟡🟡🟡🟡🟡🟡🟡🟡🟡]\n0.00 KB of {format_size(file_size_bytes)}\nSpeed: 0.00 MB/sec\nETA: Calculating...\nThank you for using @CloudVerse_GoogleDriveBot",
+                    f"Downloading from Telegram...\n\n{upload_location_str}\nProgress: 0% [🟡🟡🟡🟡🟡🟡🟡🟡🟡🟡]\n0.00 KB of {format_size(file_size_bytes)}\nSpeed: 0.00 MB/sec\nETA: Calculating...\n\nThank you for using @CloudVerse_GoogleDriveBot",
                     reply_markup=progress_markup
                 )
                 message = preparing_message
@@ -260,7 +221,7 @@ async def handle_file_upload(update, ctx):
                                             eta = 0
                                         bar = ''.join('🟢' if i < percent / 10 else '🟡' for i in range(10))
                                         await message.edit_text(
-                                            f"Downloading from Telegram...\n{upload_location_str}\nProgress: {percent:.0f}% [{bar}]\n{format_size(downloaded_bytes)} of {format_size(file_size_bytes)}\nSpeed: {speed:.2f} MB/sec\nETA: {eta:.0f} seconds\nThank you for using @CloudVerse_GoogleDriveBot",
+                                            f"Downloading from Telegram...\n\n{upload_location_str}\nProgress: {percent:.0f}% [{bar}]\n{format_size(downloaded_bytes)} of {format_size(file_size_bytes)}\nSpeed: {speed:.2f} MB/sec\nETA: {eta:.0f} seconds\n\nThank you for using @CloudVerse_GoogleDriveBot",
                                             reply_markup=progress_markup
                                         )
                                         last_update = current_time
@@ -270,7 +231,7 @@ async def handle_file_upload(update, ctx):
                         else:
                             avg_chunk = 0
                         logger.info(f"[ChunkStats][Download] Chunks: {chunk_size_stats['num_chunks']}, Changes: {chunk_size_stats['changes']}, Total bytes: {chunk_size_stats['total_bytes']}, Total time: {chunk_size_stats['total_time']:.2f}s, Avg chunk size: {avg_chunk}")
-                await message.edit_text(f"Finalizing download. Uploading to Google Drive...\n{upload_location_str}", reply_markup=progress_markup)
+                await message.edit_text(f"Finalizing download. Uploading to Google Drive...\n\n{upload_location_str}", reply_markup=progress_markup)
                 with open(temp_file_path, "rb") as f:
                     file_name_to_use = getattr(file, 'file_name', None) or getattr(file, 'file_name', None) or 'UploadedFile'
                     file_mime_type = getattr(file, 'mime_type', None)
@@ -321,7 +282,7 @@ async def handle_file_upload(update, ctx):
                                     eta = 0
                                 bar = ''.join('🟢' if i < percent / 10 else '🟡' for i in range(10))
                                 await message.edit_text(
-                                    f"Uploading to Google Drive...\n{upload_location_str}\nProgress: {percent:.0f}% [{bar}]\n{format_size(status.resumable_progress)} of {format_size(file_size_bytes)}\nSpeed: {speed:.2f} MB/sec\nETA: {eta:.0f} seconds\nThank you for using @CloudVerse_GoogleDriveBot",
+                                    f"Uploading to Google Drive...\n\n{upload_location_str}\nProgress: {percent:.0f}% [{bar}]\n{format_size(status.resumable_progress)} of {format_size(file_size_bytes)}\nSpeed: {speed:.2f} MB/sec\nETA: {eta:.0f} seconds\n\nThank you for using @CloudVerse_GoogleDriveBot",
                                     reply_markup=progress_markup
                                 )
                                 last_update = current_time
@@ -332,38 +293,24 @@ async def handle_file_upload(update, ctx):
                         avg_chunk = 0
                     logger.info(f"[ChunkStats][Upload] Chunks: {upload_chunk_stats['num_chunks']}, Changes: {upload_chunk_stats['changes']}, Total bytes: {upload_chunk_stats['total_bytes']}, Total time: {upload_chunk_stats['total_time']:.2f}s, Avg chunk size: {avg_chunk}")
                     uploaded_file = response
-                    await message.edit_text(f"Upload complete! {uploaded_file['name']} is now in your Google Drive.\n{upload_location_str}")
+                    await message.edit_text(f"Upload complete! {uploaded_file['name']} is now in your Google Drive.\n\n{upload_location_str}")
                     if ctx.user_data.get('notify_completion', True):
                         await update.message.reply_text(upload_success(uploaded_file['name'], folder_name or 'your Google Drive'))
                     os.remove(temp_file_path)
                     file_type = file_mime_type or (os.path.splitext(file_name_to_use)[1][1:] if file_name_to_use else None)
-                    log_upload(telegram_id, uploaded_file['name'], file_size_bytes, file_size_gb)
-                    log_bandwidth(telegram_id, file_size_gb, context="file_upload")
                     logger.info(f"User {telegram_id} uploaded file '{uploaded_file['name']}' successfully. Size: {file_size_bytes} bytes.")
                     # After successful upload, log upload with message_id and chat_id
                     insert_upload(telegram_id, getattr(file, 'file_id', None), getattr(file, 'file_name', None), file_size_bytes, getattr(file, 'mime_type', None), message_id, chat_id, status='success', error_message=None)
         except Exception as e:
-            log_error(e, context=f"handle_file_upload user_id={telegram_id}")
             if preparing_message:
                 await preparing_message.edit_text(ERROR(str(e)))
             if temp_file_path and os.path.exists(temp_file_path):
                 os.remove(temp_file_path)
-            log_error(e, context="file_upload_inner")
     except Exception as e:
         if preparing_message:
             await preparing_message.edit_text(ERROR(str(e)))
         if temp_file_path and os.path.exists(temp_file_path):
             os.remove(temp_file_path)
-        log_error(e, context="file_upload")
-        logger.error(f"Error in handle_file_upload for user: {telegram_id}: {e}", extra={"user_id": telegram_id, "operation": "handle_file_upload"})
-
-def is_streaming_site(url):
-    # Basic check for common streaming sites; can be expanded
-    streaming_sites = [
-        'youtube.com', 'youtu.be', 'vimeo.com', 'dailymotion.com', 'facebook.com', 'twitter.com', 'tiktok.com',
-        'soundcloud.com', 'bilibili.com', 'twitch.tv', 'instagram.com', 'reddit.com', 'rumble.com', 'odysee.com'
-    ]
-    return any(site in url for site in streaming_sites)
 
 def download_with_ytdlp(url, temp_dir=None):
     import tempfile
@@ -382,10 +329,15 @@ def download_with_ytdlp(url, temp_dir=None):
     # Return the most recently modified file
     return max(files, key=os.path.getmtime)
 
+@handle_errors
 async def handle_url_upload(update, ctx):
     """Handle file upload from URL, including error handling and logging."""
     url = update.message.text if update.message and update.message.text else None
     if not url:
+        return
+    # Add check for supported link
+    if not is_streaming_site(url) and not is_direct_file_url(url):
+        await update.message.reply_text("❌ This link is not supported. Please provide a direct file link or a supported media site or contact cloudverse support team for more")
         return
     if update.message and update.message.from_user:
         telegram_id = update.message.from_user.id
@@ -465,7 +417,7 @@ async def handle_url_upload(update, ctx):
                                     eta = 0
                                 bar = ''.join('🟢' if i < percent / 10 else '🟡' for i in range(10))
                                 await preparing_message.edit_text(
-                                    f"Downloading from URL...\nProgress: {percent:.0f}% [{bar}]\n{format_size(downloaded_bytes)} of {(format_size(file_size_bytes) if file_size_bytes else 'Unknown')}\nSpeed: {speed:.2f} MB/sec\nETA: {eta:.0f} seconds\nThank you for using @CloudVerse_GoogleDriveBot"
+                                    f"Downloading from URL...\n\nProgress: {percent:.0f}% [{bar}]\n{format_size(downloaded_bytes)} of {(format_size(file_size_bytes) if file_size_bytes else 'Unknown')}\nSpeed: {speed:.2f} MB/sec\nETA: {eta:.0f} seconds\n\nThank you for using @CloudVerse_GoogleDriveBot"
                                 )
                                 last_update = current_time
                 # Log chunk size stats for download
@@ -481,10 +433,15 @@ async def handle_url_upload(update, ctx):
             os.remove(temp_file_path)
         return
     if not temp_file_path or not os.path.exists(temp_file_path):
-        await update.message.reply_text("❌ Download failed or file not found.")
+        await update.message.reply_text(DOWNLOAD_FAILED_OR_NOT_FOUND_MSG)
         return
     # Upload to Google Drive
     try:
+        if service is None:
+            await update.message.reply_text("❌ Google Drive service is not available. Please try again later.")
+            if temp_file_path and os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
+            return
         media = MediaFileUpload(temp_file_path, mimetype="application/octet-stream", resumable=True)
         request = service.files().create(body={"name": file_name_to_use, "parents": [parent_id]}, media_body=media)
         response = None
@@ -525,7 +482,7 @@ async def handle_url_upload(update, ctx):
                     eta = (file_size_bytes - status.resumable_progress) / (speed * 1024 * 1024) if speed > 0 and file_size_bytes else 0
                     bar = ''.join('🟢' if i < percent / 10 else '🟡' for i in range(10))
                     await preparing_message.edit_text(
-                        f"Uploading to Google Drive...\nProgress: {percent:.0f}% [{bar}]\n{format_size(status.resumable_progress)} of {format_size(file_size_bytes)}\nSpeed: {speed:.2f} MB/sec\nETA: {eta:.0f} seconds\nThank you for using @CloudVerse_GoogleDriveBot"
+                        f"Uploading to Google Drive...\n\nProgress: {percent:.0f}% [{bar}]\n{format_size(status.resumable_progress)} of {format_size(file_size_bytes)}\nSpeed: {speed:.2f} MB/sec\nETA: {eta:.0f} seconds\n\nThank you for using @CloudVerse_GoogleDriveBot"
                     )
                     last_update = current_time
         # Log chunk size stats for upload
@@ -535,7 +492,7 @@ async def handle_url_upload(update, ctx):
             avg_chunk = 0
         logger.info(f"[ChunkStats][Upload] Chunks: {upload_chunk_stats['num_chunks']}, Changes: {upload_chunk_stats['changes']}, Total bytes: {upload_chunk_stats['total_bytes']}, Total time: {upload_chunk_stats['total_time']:.2f}s, Avg chunk size: {avg_chunk}")
         uploaded_file = response
-        await preparing_message.edit_text(f"Upload complete! {uploaded_file['name']} is now in your Google Drive.")
+        await preparing_message.edit_text(f"Upload complete! {uploaded_file['name']} is now in your Google Drive.\n\n")
         await update.message.reply_text(upload_success(uploaded_file['name'], 'your Google Drive'))
     except Exception as e:
         await update.message.reply_text(f"❌ Upload to Google Drive failed: {e}")
@@ -546,20 +503,9 @@ async def handle_url_upload(update, ctx):
     file_type = os.path.splitext(file_name_to_use)[1][1:] if file_name_to_use else None
     file_size_gb = file_size_bytes / (1024 ** 3) if file_size_bytes else 0
     if 'uploaded_file' in locals() and uploaded_file:
-        log_upload(telegram_id, uploaded_file['name'], file_size_bytes, file_size_gb)
-        log_bandwidth(telegram_id, file_size_gb, context="url_upload")
         logger.info(f"User {telegram_id} uploaded file '{uploaded_file['name']}' successfully. Size: {file_size_bytes} bytes.")
-except Exception as e:
-    log_error(e, context=f"handle_url_upload user_id={telegram_id}")
-    if preparing_message:
-        await preparing_message.edit_text(ERROR(str(e)))
-    if 'temp_file_path' in locals() and temp_file_path and os.path.exists(temp_file_path):
-        os.remove(temp_file_path)
-    # --- Log failed upload ---
-    file_type = os.path.splitext(file_name_to_use)[1][1:] if 'file_name_to_use' in locals() else None
-    log_error(e, context="url_upload")
-    logger.error(f"Error in handle_url_upload for user: {telegram_id}: {e}", extra={"user_id": telegram_id, "operation": "handle_url_upload"})
 
+@handle_errors
 async def cancel_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if ctx.user_data is not None:
         ctx.user_data['cancel_upload'] = True
@@ -576,3 +522,14 @@ def log_delete_action(telegram_id, file_type=None):
 
 def log_share_action(telegram_id, file_type=None):
     pass 
+
+# Utility functions for user messages
+
+def warning_low_space(free_space, percent_free):
+    return f"⚠️ Warning: Only {free_space:.2f} GB left ({percent_free:.1f}% free). Consider freeing up space."
+
+def upload_success(file_name, location):
+    return f"Upload successful: {file_name} in {location}."
+
+def ERROR(error):
+    return f"❌ Error: {error}" 

@@ -1,17 +1,3 @@
-"""
-Analytics Report Generator for CloudVerse Bot
-
-Required installations:
-pip install reportlab matplotlib pandas
-
-This module provides 3 different PDF report styles:
-1. Professional Report - Corporate-style with detailed analysis
-2. Dashboard Report - Visual dashboard with charts and metrics
-3. Minimalist Report - Simple, clean report with essential data
-
-Reports are automatically sent to the admin control group chat.
-"""
-
 import os
 from reportlab.lib.pagesizes import letter, A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
@@ -23,18 +9,16 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfbase import pdfmetrics
 from reportlab.lib.fonts import addMapping
 from typing import Any
-DEFAULT_PAGE_SIZE = 10  # Configurable default page size for pagination
+DEFAULT_PAGE_SIZE = 10
 
-# Register Helvetica (or fallback to built-in if not available)
 pdfmetrics.registerFont(TTFont('Helvetica', 'Utilities/Helvetica.ttf'))
 addMapping('Helvetica', 0, 0, 'Helvetica')
 
 LOGO_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '../Utilities/CloudVerse_Logo.jpg'))
 
-# Optional matplotlib imports for chart generation
 try:
-    import matplotlib.pyplot as plt  # type: ignore
-    import matplotlib.dates as mdates  # type: ignore
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
     MATPLOTLIB_AVAILABLE = True
 except ImportError:
     MATPLOTLIB_AVAILABLE = False
@@ -46,52 +30,37 @@ import tempfile
 from datetime import datetime, timedelta
 import sqlite3
 from .config import DB_PATH, GROUP_CHAT_ID, TeamCloudverse_TOPIC_ID
-from .database import is_admin, get_admins, get_all_users_for_analytics, get_user_upload_stats, get_user_monthly_bandwidth
-from .Utilities import paginate_list
+from .database import is_admin, get_admins, get_all_users_for_analytics, get_user_upload_stats, get_user_monthly_bandwidth, get_user_top_file_types, get_user_upload_activity_by_hour, get_user_details_by_id, get_user_total_bandwidth, get_user_uploads_per_day, get_analytics_data
+from .Utilities import pagination, handle_errors
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from .TeamCloudverse import post_report
-from .Logger import get_logger, log_error
-logger = get_logger()
 import numpy as np
 
-ANALYTICS_REPORT_GENERATOR = "Analytics Report Generator"
-PROFESSIONAL_REPORT = "Professional Report"
-DASHBOARD_REPORT = "Dashboard Report"
-MINIMALIST_REPORT = "Minimalist Report"
-CANCEL = "Cancel"
-GENERATING_REPORT = "Generating report..."
-FAILED_TO_RETRIEVE_ANALYTICS = "Failed to retrieve analytics data."
-FAILED_TO_GENERATE_REPORT = "Failed to generate report."
-REPORT_GENERATED_AND_SENT = "Report generated and sent."
-REPORT_GENERATED_AND_SENT_TO_GROUP = "Report generated and sent to group."
-INVALID_REPORT_TYPE = "Invalid report type."
-
-def get_analytics_data():
-    """Get comprehensive analytics data from database"""
-    try:
-        # This function is no longer available after the database refactor.
-        # It will return an empty dictionary or raise an error.
-        logger.warning("get_analytics_data_db is no longer available. Returning empty data.")
-        return {}
-    except Exception as e:
-        log_error(e, context="get_analytics_data")
-        return {}
+# Message constants (user-facing)
+ANALYTICS_REPORT_GENERATOR_TITLE = "📊 Analytics Report Generator\n\nSelect report type:"
+PROFESSIONAL_REPORT_BUTTON = "📋 Professional Report (10-15s)"
+MINIMALIST_REPORT_BUTTON = "📜 Minimalist Report (5-8s)"
+INDIVIDUAL_REPORTS_BUTTON = "🗃️ Individual reports"
+CANCEL_BUTTON = "❌ Cancel"
+GENERATING_REPORT_MSG = "Generating report..."
+FAILED_TO_RETRIEVE_ANALYTICS_MSG = "Failed to retrieve analytics data."
+FAILED_TO_GENERATE_REPORT_MSG = "Failed to generate report."
+REPORT_GENERATED_AND_SENT_MSG = "Report generated and sent."
+REPORT_GENERATED_AND_SENT_TO_GROUP_MSG = "Report generated and sent to group."
+INVALID_REPORT_TYPE_MSG = "Invalid report type."
+SELECT_USER_FOR_INDIVIDUAL_REPORT_MSG = "Select a user for individual report:"
+GENERATING_INDIVIDUAL_REPORT_MSG = "Generating individual dashboard report..."
+MATPLOTLIB_NOT_INSTALLED_MSG = "matplotlib is not installed. Please install it to generate individual reports."
+INDIVIDUAL_REPORT_SENT_MSG = "Individual dashboard report sent."
+FAILED_TO_GENERATE_INDIVIDUAL_REPORT_MSG = "Failed to generate individual report. Please try again later."
 
 def generate_charts(data):
-    """Generate charts for PDF reports"""
+    """Generate charts for PDF reports using matplotlib, if available."""
     charts = {}
-    
-    if not MATPLOTLIB_AVAILABLE:
-        logger.warning("Matplotlib not available - charts will be skipped")
-        return charts
-    
-    # Type assertion since we know plt is available when MATPLOTLIB_AVAILABLE is True
-    assert plt is not None
-    
     try:
+        # Daily uploads chart
         if data.get('daily_uploads'):
-            # Daily uploads chart
             plt.figure(figsize=(10, 6))
             dates, counts = zip(*data['daily_uploads'])
             plt.plot(dates, counts, marker='o', linewidth=2, markersize=6)
@@ -101,13 +70,11 @@ def generate_charts(data):
             plt.xticks(rotation=45)
             plt.grid(True, alpha=0.3)
             plt.tight_layout()
-            
             chart_buffer = io.BytesIO()
             plt.savefig(chart_buffer, format='png', dpi=300, bbox_inches='tight')
             chart_buffer.seek(0)
             charts['daily_uploads'] = chart_buffer
             plt.close()
-        
         # User distribution pie chart
         plt.figure(figsize=(8, 8))
         labels = ['Whitelisted', 'Pending', 'Admins']
@@ -116,19 +83,96 @@ def generate_charts(data):
         plt.pie(sizes, labels=labels, colors=colors_pie, autopct='%1.1f%%', startangle=90)
         plt.title('User Distribution', fontsize=14, fontweight='bold')
         plt.axis('equal')
-        
         chart_buffer = io.BytesIO()
         plt.savefig(chart_buffer, format='png', dpi=300, bbox_inches='tight')
         chart_buffer.seek(0)
         charts['user_distribution'] = chart_buffer
         plt.close()
-        
+        # Bandwidth usage chart
+        if data.get('bandwidth_usage'):
+            plt.figure(figsize=(10, 6))
+            dates, bandwidths = zip(*data['bandwidth_usage'])
+            bandwidths_mb = [b / (1024 * 1024) for b in bandwidths]
+            plt.plot(dates, bandwidths_mb, marker='o', linewidth=2, markersize=6, color='#1a237e')
+            plt.title('Bandwidth Usage (Last 30 Days)', fontsize=14, fontweight='bold')
+            plt.xlabel('Date', fontsize=12)
+            plt.ylabel('Bandwidth (MB)', fontsize=12)
+            plt.xticks(rotation=45)
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            chart_buffer = io.BytesIO()
+            plt.savefig(chart_buffer, format='png', dpi=300, bbox_inches='tight')
+            chart_buffer.seek(0)
+            charts['bandwidth_usage'] = chart_buffer
+            plt.close()
+        # File type distribution pie chart
+        if data.get('file_types'):
+            plt.figure(figsize=(8, 8))
+            labels, counts = zip(*data['file_types']) if data['file_types'] else ([], [])
+            plt.pie(counts, labels=labels, autopct='%1.1f%%', startangle=90)
+            plt.title('File Type Distribution (Last 30 Days)', fontsize=14, fontweight='bold')
+            plt.axis('equal')
+            chart_buffer = io.BytesIO()
+            plt.savefig(chart_buffer, format='png', dpi=300, bbox_inches='tight')
+            chart_buffer.seek(0)
+            charts['file_types'] = chart_buffer
+            plt.close()
+        # Activity by hour bar chart
+        if data.get('activity_by_hour'):
+            plt.figure(figsize=(10, 6))
+            hours, counts = zip(*data['activity_by_hour'])
+            plt.bar(hours, counts, color='#4ECDC4')
+            plt.title('Upload Activity by Hour (Last 30 Days)', fontsize=14, fontweight='bold')
+            plt.xlabel('Hour of Day', fontsize=12)
+            plt.ylabel('Uploads', fontsize=12)
+            plt.xticks(range(0, 24))
+            plt.tight_layout()
+            chart_buffer = io.BytesIO()
+            plt.savefig(chart_buffer, format='png', dpi=300, bbox_inches='tight')
+            chart_buffer.seek(0)
+            charts['activity_by_hour'] = chart_buffer
+            plt.close()
+        # User growth chart
+        if data.get('user_growth'):
+            plt.figure(figsize=(10, 6))
+            dates, counts = zip(*data['user_growth'])
+            plt.plot(dates, counts, marker='o', linewidth=2, markersize=6, color='#2E8B57')
+            plt.title('User Growth (Last 30 Days)', fontsize=14, fontweight='bold')
+            plt.xlabel('Date', fontsize=12)
+            plt.ylabel('New Users', fontsize=12)
+            plt.xticks(rotation=45)
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            chart_buffer = io.BytesIO()
+            plt.savefig(chart_buffer, format='png', dpi=300, bbox_inches='tight')
+            chart_buffer.seek(0)
+            charts['user_growth'] = chart_buffer
+            plt.close()
+        # Error rates chart
+        if data.get('error_rates'):
+            plt.figure(figsize=(10, 6))
+            dates, counts = zip(*data['error_rates']) if data['error_rates'] else ([], [])
+            plt.plot(dates, counts, marker='o', linewidth=2, markersize=6, color='#FF6B6B')
+            plt.title('Error Rates (Last 30 Days)', fontsize=14, fontweight='bold')
+            plt.xlabel('Date', fontsize=12)
+            plt.ylabel('Errors', fontsize=12)
+            plt.xticks(rotation=45)
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            chart_buffer = io.BytesIO()
+            plt.savefig(chart_buffer, format='png', dpi=300, bbox_inches='tight')
+            chart_buffer.seek(0)
+            charts['error_rates'] = chart_buffer
+            plt.close()
+        # Storage usage (single value, show as text or bar)
+        if 'storage_usage' in data:
+            charts['storage_usage'] = data['storage_usage']
     except Exception as e:
-        log_error(e, context="generate_charts")
-    
+        print(f"Error in generate_charts: {e}")
     return charts
 
 def professional_header(story, title, styles):
+    """Add a professional header with logo and title to the PDF story."""
     from reportlab.platypus import Image, Table, TableStyle, Spacer, Paragraph
     from reportlab.lib.units import inch
     import os
@@ -147,310 +191,242 @@ def professional_header(story, title, styles):
     story.append(header_table)
     story.append(Spacer(1, 20))
 
-def professional_footer(story, styles):
+def professional_footer(story, styles, generated_by_name, generated_by_username, timestamp):
+    """Add a professional footer to the PDF story with timestamp and generator info."""
     from reportlab.platypus import Spacer, Paragraph
-    story.append(Spacer(1, 30))
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib import colors
     footer_style = ParagraphStyle(
         'Footer',
         parent=styles['Normal'],
         fontName='Helvetica',
-        fontSize=10,
+        fontSize=9,
+        alignment=TA_CENTER,
+        textColor=colors.HexColor('#888')
+    )
+    story.append(Spacer(1, 20))
+    story.append(Paragraph(f"Generated: {timestamp}", footer_style))
+    story.append(Paragraph(f"Generated by: {generated_by_name} (@{generated_by_username})", footer_style))
+
+def minimalist_footer(story, styles, generated_by_name, generated_by_username, timestamp):
+    """Add a minimalist footer to the PDF story with timestamp and generator info."""
+    from reportlab.platypus import Spacer, Paragraph
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib import colors
+    footer_style = ParagraphStyle(
+        'Footer',
+        parent=styles['Normal'],
+        fontName='Helvetica',
+        fontSize=9,
         alignment=TA_CENTER,
         textColor=colors.grey
     )
-    story.append(Paragraph("Generated by CloudVerse Analytics System", footer_style))
-    story.append(Paragraph("© 2024 CloudVerse - Professional Cloud Management", footer_style))
+    story.append(Spacer(1, 20))
+    story.append(Paragraph(f"Generated: {timestamp}", footer_style))
+    story.append(Paragraph(f"Generated by: {generated_by_name} (@{generated_by_username})", footer_style))
 
-def generate_professional_report(data, charts):
-    """Generate professional-style PDF report"""
+
+def generate_professional_report(data, charts, generated_by_name, generated_by_username):
+    """Generate a professional-style PDF analytics report with all available analytics and a modern, light/white dashboard template."""
     doc = SimpleDocTemplate("professional_report.pdf", pagesize=A4)
     story = []
     styles = getSampleStyleSheet()
+    # Modern, light/white dashboard theme
     styles['Title'].fontName = 'Helvetica'
     styles['Normal'].fontName = 'Helvetica'
-    title = "📊 CLOUDVERSE<br/>PROFESSIONAL ANALYTICS REPORT"
-    professional_header(story, title, styles)
-    
-    # Custom styles
-    title_style = ParagraphStyle(
-        'CustomTitle',
-        parent=styles['Heading1'],
-        fontSize=24,
-        spaceAfter=30,
-        alignment=TA_CENTER,
-        textColor=colors.darkblue
-    )
-    
-    section_style = ParagraphStyle(
-        'SectionTitle',
-        parent=styles['Heading2'],
-        fontSize=16,
-        spaceAfter=20,
-        spaceBefore=20,
-        textColor=colors.darkblue
-    )
-    
+    styles['Title'].fontSize = 26
+    styles['Title'].textColor = colors.HexColor('#1a237e')
+    styles['Normal'].fontSize = 12
+    styles['Normal'].textColor = colors.HexColor('#222')
+    title = "CloudVerse Professional Analytics Dashboard"
+    # Header
+    story.append(Spacer(1, 16))
+    story.append(Paragraph(title, styles['Title']))
+    story.append(Spacer(1, 8))
     # Report metadata
-    story.append(Paragraph(f"Generated: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}", styles['Normal']))
-    story.append(Paragraph(f"Report Period: Last 30 Days", styles['Normal']))
-    story.append(Paragraph(f"Report Type: Professional Analysis", styles['Normal']))
-    story.append(Spacer(1, 40))
-    
-    # Executive Summary
-    story.append(Paragraph("Executive Summary", section_style))
-    story.append(Paragraph("This report provides a comprehensive overview of CloudVerse system performance, user engagement, and operational metrics.", styles['Normal']))
-    story.append(Spacer(1, 20))
-    
-    # Key Metrics Table
-    key_metrics_data = [
-        ['Metric', 'Value', 'Status'],
-        ['Total Users', f"{data.get('whitelisted_count', 0):,}", '✅ Active'],
-        ['Pending Users', f"{data.get('pending_count', 0):,}", '⏳ Pending'],
-        ['Admin Users', f"{data.get('admin_count', 0):,}", '👑 Admin'],
-        ['Total Uploads', f"{data.get('total_uploads', 0):,}", '📁 Files'],
-        ['Recent Uploads (7d)', f"{data.get('recent_uploads', 0):,}", '📈 Trend'],
-        ['Total Broadcasts', f"{data.get('total_broadcasts', 0):,}", '📢 Messages'],
-        ['Approved Broadcasts', f"{data.get('approved_broadcasts', 0):,}", '✅ Approved']
+    timestamp = datetime.now().strftime('%B %d, %Y at %I:%M %p')
+    story.append(Paragraph(f"<b>Report Period:</b> Last 30 Days", styles['Normal']))
+    story.append(Paragraph(f"<b>Report Type:</b> Professional Analysis", styles['Normal']))
+    story.append(Spacer(1, 18))
+    # Key Metrics Table (dashboard style)
+    from reportlab.platypus import Table, TableStyle
+    metrics_data = [
+        ["Total Users", f"{data.get('whitelisted_count', 0):,}"],
+        ["Pending Users", f"{data.get('pending_count', 0):,}"],
+        ["Admin Users", f"{data.get('admin_count', 0):,}"],
+        ["Total Uploads", f"{data.get('total_uploads', 0):,}"],
+        ["Recent Uploads (7d)", f"{data.get('recent_uploads', 0):,}"],
+        ["Total Broadcasts", f"{data.get('total_broadcasts', 0):,}"],
+        ["Approved Broadcasts", f"{data.get('approved_broadcasts', 0):,}"]
     ]
-    
-    key_metrics_table = Table(key_metrics_data, colWidths=[2*inch, 1.5*inch, 1.5*inch])
-    key_metrics_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.darkblue),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, 0), 12),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-        ('GRID', (0, 0), (-1, -1), 1, colors.black)
+    metrics_table = Table(metrics_data, colWidths=[2.5*inch, 1.5*inch])
+    metrics_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#f5f7fa')),
+        ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#1a237e')),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 0), (-1, -1), 12),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ('TOPPADDING', (0, 0), (-1, -1), 8),
+        ('ROWBACKGROUNDS', (0, 0), (-1, -1), [colors.HexColor('#f5f7fa'), colors.white]),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e3e6ee'))
     ]))
-    story.append(key_metrics_table)
-    story.append(Spacer(1, 30))
-    
-    # User Analytics Section
-    story.append(Paragraph("User Analytics", section_style))
+    story.append(metrics_table)
+    story.append(Spacer(1, 18))
+    # User Distribution Pie Chart
     if 'user_distribution' in charts:
-        story.append(Image(charts['user_distribution'], width=6*inch, height=6*inch))
-        story.append(Spacer(1, 20))
-    
-    # Usage Analytics Section
-    story.append(Paragraph("Usage Analytics", section_style))
+        story.append(Paragraph("<b>User Distribution</b>", styles['Normal']))
+        story.append(Image(charts['user_distribution'], width=5*inch, height=3*inch))
+        story.append(Spacer(1, 12))
+    # Daily Uploads Chart
     if 'daily_uploads' in charts:
-        story.append(Image(charts['daily_uploads'], width=7*inch, height=4*inch))
-        story.append(Spacer(1, 20))
-    
-    # System Performance
-    story.append(Paragraph("System Performance", section_style))
-    performance_text = f"""
-    <b>System Health:</b> Excellent<br/>
-    <b>Average Response Time:</b> 1.2 seconds<br/>
-    <b>Error Rate:</b> 0.3%<br/>
-    <b>System Uptime:</b> 99.8%<br/>
-    <b>Database Performance:</b> Optimal<br/>
-    """
-    story.append(Paragraph(performance_text, styles['Normal']))
-    
-    # Recommendations
-    story.append(Paragraph("Recommendations", section_style))
+        story.append(Paragraph("<b>Daily Uploads (Last 30 Days)</b>", styles['Normal']))
+        story.append(Image(charts['daily_uploads'], width=6*inch, height=2.5*inch))
+        story.append(Spacer(1, 12))
+    # Bandwidth Usage Chart
+    if 'bandwidth_usage' in charts:
+        story.append(Paragraph("<b>Bandwidth Usage (Last 30 Days)</b>", styles['Normal']))
+        story.append(Image(charts['bandwidth_usage'], width=6*inch, height=2.5*inch))
+        story.append(Spacer(1, 12))
+    # File Type Distribution Pie Chart
+    if 'file_types' in charts:
+        story.append(Paragraph("<b>File Type Distribution (Last 30 Days)</b>", styles['Normal']))
+        story.append(Image(charts['file_types'], width=5*inch, height=3*inch))
+        story.append(Spacer(1, 12))
+    # Activity by Hour Bar Chart
+    if 'activity_by_hour' in charts:
+        story.append(Paragraph("<b>Upload Activity by Hour (Last 30 Days)</b>", styles['Normal']))
+        story.append(Image(charts['activity_by_hour'], width=6*inch, height=2.5*inch))
+        story.append(Spacer(1, 12))
+    # User Growth Chart
+    if 'user_growth' in charts:
+        story.append(Paragraph("<b>User Growth (Last 30 Days)</b>", styles['Normal']))
+        story.append(Image(charts['user_growth'], width=6*inch, height=2.5*inch))
+        story.append(Spacer(1, 12))
+    # Error Rates Chart
+    if 'error_rates' in charts:
+        story.append(Paragraph("<b>Error Rates (Last 30 Days)</b>", styles['Normal']))
+        story.append(Image(charts['error_rates'], width=6*inch, height=2.5*inch))
+        story.append(Spacer(1, 12))
+    # Storage Usage (Single Value)
+    if 'storage_usage' in charts:
+        story.append(Paragraph("<b>Storage Usage</b>", styles['Normal']))
+        story.append(Paragraph(f"{charts['storage_usage']:,}", styles['Normal']))
+        story.append(Spacer(1, 12))
+    # Recommendations (static)
     recommendations = f"""
     <b>1. User Growth:</b> Continue monitoring user acquisition trends<br/>
     <b>2. Storage Optimization:</b> Monitor storage usage patterns<br/>
     <b>3. Performance:</b> Maintain current system performance levels<br/>
     <b>4. Security:</b> Regular security audits recommended<br/>
     """
+    story.append(Paragraph("<b>Recommendations</b>", styles['Normal']))
     story.append(Paragraph(recommendations, styles['Normal']))
-    
-    professional_footer(story, styles)
+    # Footer (timestamp and generator info)
+    professional_footer(story, styles, generated_by_name, generated_by_username, timestamp)
     return doc, story
 
-def generate_dashboard_report(data, charts):
-    """Generate dashboard-style PDF report"""
-    doc = SimpleDocTemplate("dashboard_report.pdf", pagesize=A4)
-    story = []
-    styles = getSampleStyleSheet()
-    styles['Title'].fontName = 'Helvetica'
-    styles['Normal'].fontName = 'Helvetica'
-    title = "📊 CLOUDVERSE<br/>DASHBOARD REPORT"
-    professional_header(story, title, styles)
-    
-    # Custom styles for dashboard
-    dashboard_title_style = ParagraphStyle(
-        'DashboardTitle',
-        parent=styles['Heading1'],
-        fontSize=28,
-        spaceAfter=20,
-        alignment=TA_CENTER,
-        textColor=colors.darkgreen
-    )
-    
-    metric_style = ParagraphStyle(
-        'MetricStyle',
-        parent=styles['Heading2'],
-        fontSize=18,
-        spaceAfter=10,
-        alignment=TA_CENTER,
-        textColor=colors.darkgreen
-    )
-    
-    # Report metadata
-    story.append(Paragraph(f"Generated: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}", styles['Normal']))
-    story.append(Paragraph(f"Report Period: Last 30 Days", styles['Normal']))
-    story.append(Paragraph(f"Report Type: Dashboard Overview", styles['Normal']))
-    story.append(Spacer(1, 30))
-    
-    # Key Metrics in Grid Layout
-    metrics_data = [
-        [Paragraph(f"👥<br/>Total Users<br/><b>{data.get('whitelisted_count', 0):,}</b>", metric_style),
-         Paragraph(f"📁<br/>Total Uploads<br/><b>{data.get('total_uploads', 0):,}</b>", metric_style),
-         Paragraph(f"📢<br/>Broadcasts<br/><b>{data.get('total_broadcasts', 0):,}</b>", metric_style)],
-        [Paragraph(f"⏳<br/>Pending Users<br/><b>{data.get('pending_count', 0):,}</b>", metric_style),
-         Paragraph(f"📈<br/>Recent Uploads<br/><b>{data.get('recent_uploads', 0):,}</b>", metric_style),
-         Paragraph(f"✅<br/>Approved Broadcasts<br/><b>{data.get('approved_broadcasts', 0):,}</b>", metric_style)]
-    ]
-    
-    metrics_table = Table(metrics_data, colWidths=[2.5*inch, 2.5*inch, 2.5*inch])
-    metrics_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, -1), colors.lightgrey),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ('GRID', (0, 0), (-1, -1), 1, colors.white),
-        ('ROWBACKGROUNDS', (0, 0), (-1, 0), [colors.lightblue]),
-        ('ROWBACKGROUNDS', (0, 1), (-1, 1), [colors.lightgreen])
-    ]))
-    story.append(metrics_table)
-    story.append(Spacer(1, 30))
-    
-    # Charts Section
-    story.append(Paragraph("📈 Activity Charts", ParagraphStyle('ChartTitle', parent=styles['Heading2'], fontSize=20, alignment=TA_CENTER)))
-    story.append(Spacer(1, 20))
-    
-    if 'daily_uploads' in charts:
-        story.append(Image(charts['daily_uploads'], width=7*inch, height=4*inch))
-        story.append(Spacer(1, 20))
-    
-    if 'user_distribution' in charts:
-        story.append(Image(charts['user_distribution'], width=6*inch, height=6*inch))
-        story.append(Spacer(1, 20))
-    
-    # Quick Insights
-    story.append(Paragraph("💡 Quick Insights", ParagraphStyle('InsightsTitle', parent=styles['Heading2'], fontSize=20, alignment=TA_CENTER)))
-    story.append(Spacer(1, 20))
-    
-    insights_text = f"""
-    <b>🎯 Growth Trend:</b> System shows steady user growth<br/>
-    <b>📊 Activity Peak:</b> Highest activity during business hours<br/>
-    <b>🔧 System Health:</b> All systems operating normally<br/>
-    <b>📈 Engagement:</b> High user engagement with broadcast features<br/>
-    """
-    story.append(Paragraph(insights_text, styles['Normal']))
-    
-    professional_footer(story, styles)
-    return doc, story
-
-def generate_minimalist_report(data, charts):
-    """Generate minimalist-style PDF report"""
+def generate_minimalist_report(data, charts, generated_by_name, generated_by_username):
+    """Generate a minimalist-style PDF analytics report with essential data only and a clean, light template."""
     doc = SimpleDocTemplate("minimalist_report.pdf", pagesize=A4)
     story = []
     styles = getSampleStyleSheet()
+    # Minimalist, light/white theme
     styles['Title'].fontName = 'Helvetica'
     styles['Normal'].fontName = 'Helvetica'
-    title = "CloudVerse Analytics"
-    professional_header(story, title, styles)
-    
-    # Minimalist styles
-    minimalist_title_style = ParagraphStyle(
-        'MinimalistTitle',
-        parent=styles['Heading1'],
-        fontSize=20,
-        spaceAfter=30,
-        alignment=TA_CENTER,
-        textColor=colors.black
-    )
-    
-    section_style = ParagraphStyle(
-        'MinimalistSection',
-        parent=styles['Heading2'],
-        fontSize=14,
-        spaceAfter=15,
-        spaceBefore=20,
-        textColor=colors.black
-    )
-    
+    styles['Title'].fontSize = 22
+    styles['Title'].textColor = colors.HexColor('#222')
+    styles['Normal'].fontSize = 12
+    styles['Normal'].textColor = colors.HexColor('#333')
+    title = "CloudVerse Minimalist Analytics"
+    # Header
+    story.append(Spacer(1, 16))
+    story.append(Paragraph(title, styles['Title']))
+    story.append(Spacer(1, 8))
     # Report metadata
-    story.append(Paragraph(f"Generated: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}", styles['Normal']))
-    story.append(Paragraph(f"Report Period: Last 30 Days", styles['Normal']))
-    story.append(Paragraph(f"Report Type: Minimalist Overview", styles['Normal']))
-    story.append(Spacer(1, 40))
-
-    # Simple metrics
-    story.append(Paragraph("Key Metrics", section_style))
-    metrics_text = f"""
-    Total Users: {data.get('whitelisted_count', 0):,}<br/>
-    Total Uploads: {data.get('total_uploads', 0):,}<br/>
-    Pending Users: {data.get('pending_count', 0):,}<br/>
-    Admin Users: {data.get('admin_count', 0):,}<br/>
-    Recent Uploads (7d): {data.get('recent_uploads', 0):,}<br/>
-    Total Broadcasts: {data.get('total_broadcasts', 0):,}<br/>
-    """
-    story.append(Paragraph(metrics_text, styles['Normal']))
-    story.append(Spacer(1, 30))
-    
-    # Simple chart
+    timestamp = datetime.now().strftime('%B %d, %Y at %I:%M %p')
+    story.append(Paragraph(f"<b>Report Period:</b> Last 30 Days", styles['Normal']))
+    story.append(Paragraph(f"<b>Report Type:</b> Minimalist Overview", styles['Normal']))
+    story.append(Spacer(1, 18))
+    # Key Metrics (summary boxes)
+    from reportlab.platypus import Table, TableStyle
+    metrics_data = [
+        ["Total Users", f"{data.get('whitelisted_count', 0):,}"],
+        ["Total Uploads", f"{data.get('total_uploads', 0):,}"],
+        ["Pending Users", f"{data.get('pending_count', 0):,}"],
+        ["Admin Users", f"{data.get('admin_count', 0):,}"],
+        ["Recent Uploads (7d)", f"{data.get('recent_uploads', 0):,}"],
+        ["Total Broadcasts", f"{data.get('total_broadcasts', 0):,}"]
+    ]
+    metrics_table = Table(metrics_data, colWidths=[2.5*inch, 1.5*inch])
+    metrics_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), colors.whitesmoke),
+        ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#222')),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 0), (-1, -1), 12),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ('TOPPADDING', (0, 0), (-1, -1), 8),
+        ('ROWBACKGROUNDS', (0, 0), (-1, -1), [colors.whitesmoke, colors.white]),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#eee'))
+    ]))
+    story.append(metrics_table)
+    story.append(Spacer(1, 18))
+    # Simple chart (Upload Activity)
     if 'daily_uploads' in charts:
-        story.append(Paragraph("Upload Activity", section_style))
-        story.append(Image(charts['daily_uploads'], width=6*inch, height=3*inch))
-        story.append(Spacer(1, 30))
-    
+        story.append(Paragraph("<b>Upload Activity (Last 30 Days)</b>", styles['Normal']))
+        story.append(Image(charts['daily_uploads'], width=6*inch, height=2.5*inch))
+        story.append(Spacer(1, 18))
     # Simple summary
-    story.append(Paragraph("Summary", section_style))
     summary_text = f"""
-    The system is operating normally with {data.get('whitelisted_count', 0):,} active users. 
-    {data.get('total_uploads', 0):,} files have been uploaded to date. 
-    Recent activity shows {data.get('recent_uploads', 0):,} uploads in the last 7 days.
+    <b>System Status:</b> Normal<br/>
+    <b>Active Users:</b> {data.get('whitelisted_count', 0):,}<br/>
+    <b>Uploads (7d):</b> {data.get('recent_uploads', 0):,}<br/>
+    <b>Performance:</b> Stable<br/>
     """
     story.append(Paragraph(summary_text, styles['Normal']))
-    
-    professional_footer(story, styles)
+    # Footer (timestamp and generator info)
+    minimalist_footer(story, styles, generated_by_name, generated_by_username, timestamp)
     return doc, story
 
+@handle_errors
 async def handle_analytics_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle analytics report generation request"""
+    """Display analytics report options and handle user selection for report type."""
     q = update.callback_query
     if not q or not q.from_user:
         return
 
     telegram_id = q.from_user.id
-    # Remove admin-only restriction for menu, but keep for other reports
-    # if not is_admin(telegram_id):
-    #     await q.answer("You don't have permission to generate analytics reports.")
-    #     return
+    if not is_admin(telegram_id):
+        await q.answer("You don't have permission to generate analytics reports.", show_alert=True)
+        return
 
     # Show report type selection with time estimates
-    text = "📊 Analytics Report Generator\n\nSelect report type:"
+    text = ANALYTICS_REPORT_GENERATOR_TITLE
     buttons = [
-        [InlineKeyboardButton("📋 Professional Report (10-15s)", callback_data="analytics_professional")],
-        [InlineKeyboardButton("📈 Dashboard Report (8-12s)", callback_data="analytics_dashboard")],
-        [InlineKeyboardButton("📜 Minimalist Report (5-8s)", callback_data="analytics_minimalist")],
-        [InlineKeyboardButton("🗃️ Individual reports", callback_data="analytics_individual")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="admin_control")]
+        [InlineKeyboardButton(PROFESSIONAL_REPORT_BUTTON, callback_data="analytics_professional")],
+        [InlineKeyboardButton(MINIMALIST_REPORT_BUTTON, callback_data="analytics_minimalist")],
+        [InlineKeyboardButton(INDIVIDUAL_REPORTS_BUTTON, callback_data="analytics_individual")],
+        [InlineKeyboardButton(CANCEL_BUTTON, callback_data="admin_control")]
     ]
     await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
+@handle_errors
 async def generate_and_send_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE, report_type):
-    """Generate and send the selected report type"""
+    """Generate the selected analytics report type and send it to the user or group."""
     q = update.callback_query
     if not q:
         return
     
     # Show generating message with time estimate
-    time_estimate = "10-15 seconds" if report_type == "Professional" else "8-12 seconds" if report_type == "Dashboard" else "5-8 seconds"
-    await q.edit_message_text(GENERATING_REPORT)
+    time_estimate = "10-15 seconds" if report_type == "Professional" else "5-8 seconds"
+    await q.edit_message_text(GENERATING_REPORT_MSG)
     
     try:
         # Get analytics data
         data = get_analytics_data()
         if not data:
-            await q.edit_message_text(FAILED_TO_RETRIEVE_ANALYTICS)
+            await q.edit_message_text(FAILED_TO_RETRIEVE_ANALYTICS_MSG)
             return
         
         # Generate charts
@@ -458,13 +434,11 @@ async def generate_and_send_report(update: Update, ctx: ContextTypes.DEFAULT_TYP
         
         # Generate PDF based on type
         if report_type == "Professional":
-            doc, story = generate_professional_report(data, charts)
-        elif report_type == "Dashboard":
-            doc, story = generate_dashboard_report(data, charts)
+            doc, story = generate_professional_report(data, charts, q.from_user.username or 'Admin', q.from_user.username or 'Admin')
         elif report_type == "Minimalist":
-            doc, story = generate_minimalist_report(data, charts)
+            doc, story = generate_minimalist_report(data, charts, q.from_user.username or 'Admin', q.from_user.username or 'Admin')
         else:
-            await q.edit_message_text(INVALID_REPORT_TYPE)
+            await q.edit_message_text(INVALID_REPORT_TYPE_MSG)
             return
         
         # Build PDF
@@ -474,7 +448,7 @@ async def generate_and_send_report(update: Update, ctx: ContextTypes.DEFAULT_TYP
         if GROUP_CHAT_ID and TeamCloudverse_TOPIC_ID:
             await post_report(ctx, f"{report_type.lower()}_report.pdf", report_type, q.from_user.username or 'Admin')
             
-            await q.edit_message_text(REPORT_GENERATED_AND_SENT_TO_GROUP)
+            await q.edit_message_text(REPORT_GENERATED_AND_SENT_TO_GROUP_MSG)
         else:
             # Send directly to user if group not configured
             telegram_id = q.from_user.id
@@ -484,25 +458,24 @@ async def generate_and_send_report(update: Update, ctx: ContextTypes.DEFAULT_TYP
                     document=pdf_file,
                     caption=f"📊 {report_type} Analytics Report"
                 )
-            await q.edit_message_text(REPORT_GENERATED_AND_SENT)
+            await q.edit_message_text(REPORT_GENERATED_AND_SENT_MSG)
         
         # Clean up PDF file
         os.remove(f"{report_type.lower()}_report.pdf")
         
     except Exception as e:
-        log_error(e, context=f"generate_and_send_report report_type={report_type}")
-        await q.edit_message_text(FAILED_TO_GENERATE_REPORT)
+        print(f"Error in generate_and_send_report report_type={report_type}: {e}")
+        await q.edit_message_text(FAILED_TO_GENERATE_REPORT_MSG)
 
+@handle_errors
 async def handle_analytics_report_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle report type selection"""
+    """Handle the user's selection of analytics report type and trigger report generation."""
     q = update.callback_query
     if not q or not q.data:
         return
     data = q.data
     if data == "analytics_professional":
         await generate_and_send_report(update, ctx, "Professional")
-    elif data == "analytics_dashboard":
-        await generate_and_send_report(update, ctx, "Dashboard")
     elif data == "analytics_minimalist":
         await generate_and_send_report(update, ctx, "Minimalist")
     elif data == "analytics_individual":
@@ -514,6 +487,7 @@ async def handle_analytics_report_type(update: Update, ctx: ContextTypes.DEFAULT
         page = int(data.split(":")[1])
         await show_individual_user_list(update, ctx, page=page)
 
+@handle_errors
 async def show_individual_user_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE, page: int = 0) -> None:
     """Display a paginated list of users for individual analytics report selection."""
     q = update.callback_query
@@ -541,36 +515,36 @@ async def show_individual_user_list(update: Update, ctx: ContextTypes.DEFAULT_TY
     if pagination:
         buttons.append(pagination)
     buttons.append([InlineKeyboardButton("✳️ Back", callback_data="analytics_report")])
-    await q.edit_message_text("Select a user for individual report:", reply_markup=InlineKeyboardMarkup(buttons))
+    await q.edit_message_text(SELECT_USER_FOR_INDIVIDUAL_REPORT_MSG, reply_markup=InlineKeyboardMarkup(buttons))
 
+@handle_errors
 async def generate_and_send_individual_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE, user_id):
-    """Generate and send an individual analytics report for a user."""
+    """Generate and send an individual analytics report for a specific user using the minimalist template."""
     q = update.callback_query
     if not q:
-        log_error(None, context="generate_and_send_individual_report called without callback_query")
+        print("generate_and_send_individual_report called without callback_query")
         return
-    log_error(None, context=f"generate_and_send_individual_report user_id={user_id}")
-    await q.edit_message_text("Generating individual dashboard report...")
+    print(f"generate_and_send_individual_report user_id={user_id}")
+    await q.edit_message_text(GENERATING_INDIVIDUAL_REPORT_MSG)
     try:
         if not MATPLOTLIB_AVAILABLE:
-            await q.edit_message_text("matplotlib is not installed. Please install it to generate individual reports.")
+            await q.edit_message_text(MATPLOTLIB_NOT_INSTALLED_MSG)
             return
         assert plt is not None  # Ensure plt is available for linter and runtime
         import io
         from reportlab.platypus import Image
-        # Get user details (not used in chart, but could be fetched if needed)
         # Get number of uploads and upload time range
         upload_count, first_upload, last_upload = get_user_upload_stats(user_id)
-        # Upload history (per day) - left as placeholder for future
-        upload_history = []
-        # Activity histogram (by hour) - left as placeholder for future
-        activity_hist = []
-        # Top file types - left as placeholder for future
-        top_file_types = []
+        # Upload history (per day)
+        upload_history = get_user_uploads_per_day(user_id, days=30)
+        # Activity histogram (by hour)
+        activity_hist = get_user_upload_activity_by_hour(user_id)
+        # Top file types
+        top_file_types = get_user_top_file_types(user_id)
         # Prepare charts
         charts = {}
         # --- Upload history chart ---
-        if upload_history is not None and hasattr(upload_history, '__iter__') and not isinstance(upload_history, type(Ellipsis)) and len(upload_history) > 0:
+        if upload_history is not None and hasattr(upload_history, '__iter__') and len(upload_history) > 0:
             dates, counts = zip(*upload_history)
             plt.figure(figsize=(7, 3))
             plt.bar(dates, counts, color='#4ECDC4')
@@ -582,10 +556,10 @@ async def generate_and_send_individual_report(update: Update, ctx: ContextTypes.
             buf = io.BytesIO()
             plt.savefig(buf, format='png', dpi=200, bbox_inches='tight')
             buf.seek(0)
-            charts['upload_history'] = buf
+            charts['daily_uploads'] = buf
             plt.close()
         # --- Activity histogram chart ---
-        if activity_hist is not None and hasattr(activity_hist, '__iter__') and not isinstance(activity_hist, type(Ellipsis)) and len(activity_hist) > 0:
+        if activity_hist is not None and hasattr(activity_hist, '__iter__') and len(activity_hist) > 0:
             hours, counts = zip(*activity_hist)
             plt.figure(figsize=(7, 3))
             plt.bar(hours, counts, color='#2E8B57')
@@ -600,13 +574,13 @@ async def generate_and_send_individual_report(update: Update, ctx: ContextTypes.
             plt.close()
         # --- Bandwidth usage chart ---
         plt.figure(figsize=(4, 4))
-        # Get bandwidth usage
         from datetime import datetime
         current_month = datetime.now().strftime("%Y-%m")
         monthly_bandwidth = get_user_monthly_bandwidth(user_id, current_month)
-        # Overall bandwidth
-        overall_bandwidth = 0 # Placeholder, needs actual data fetching
-        plt.pie([monthly_bandwidth, overall_bandwidth - monthly_bandwidth],
+        overall_bandwidth = get_user_total_bandwidth(user_id) / (1024 * 1024)  # MB
+        monthly_bandwidth_mb = monthly_bandwidth / (1024 * 1024)
+        previous_bandwidth = max(0, overall_bandwidth - monthly_bandwidth_mb)
+        plt.pie([monthly_bandwidth_mb, previous_bandwidth],
                 labels=['Monthly', 'Previous'], autopct='%1.1f%%', colors=['#4ECDC4', '#FF6B6B'])
         plt.title('Bandwidth Usage')
         buf = io.BytesIO()
@@ -641,33 +615,35 @@ async def generate_and_send_individual_report(update: Update, ctx: ContextTypes.
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib.enums import TA_CENTER
         from reportlab.lib import colors
-        doc = SimpleDocTemplate("individual_dashboard_report.pdf", pagesize=A4)
+        doc = SimpleDocTemplate("minimalist_report.pdf", pagesize=A4)
         styles = getSampleStyleSheet()
         story = []
         # Header
         story.append(Paragraph(f"<b>Individual Dashboard Report</b>", styles['Title']))
         story.append(Spacer(1, 20))
         # Get user details for display
-        user_info = get_all_users_for_analytics(user_id)
-        first_name = user_info[2] if user_info else ''
-        last_name = user_info[3] if user_info else ''
-        username = user_info[1] if user_info else ''
-        story.append(Paragraph(f"<b>Name:</b> {first_name} {last_name}", styles['Normal']))
+        user_info = get_user_details_by_id(user_id)
+        name = user_info['name'] if user_info and 'name' in user_info else ''
+        username = user_info['username'] if user_info and 'username' in user_info else ''
+        # If name is empty, fallback to first_name/last_name if available
+        if not name and user_info:
+            name = f"{user_info.get('first_name', '')} {user_info.get('last_name', '')}".strip()
+        story.append(Paragraph(f"<b>Name:</b> {name}", styles['Normal']))
         story.append(Paragraph(f"<b>Username:</b> @{username if username else '-'}", styles['Normal']))
         story.append(Paragraph(f"<b>Telegram ID:</b> {user_id}", styles['Normal']))
         story.append(Spacer(1, 10))
         # Key stats
         story.append(Paragraph(f"<b>Total Uploads:</b> {upload_count}", styles['Normal']))
-        story.append(Paragraph(f"<b>Monthly Bandwidth Used:</b> {monthly_bandwidth:.2f} MB", styles['Normal']))
+        story.append(Paragraph(f"<b>Monthly Bandwidth Used:</b> {monthly_bandwidth_mb:.2f} MB", styles['Normal']))
         story.append(Paragraph(f"<b>Overall Bandwidth Used:</b> {overall_bandwidth:.2f} MB", styles['Normal']))
         story.append(Paragraph(f"<b>First Upload:</b> {first_upload if first_upload else '-'}", styles['Normal']))
         story.append(Paragraph(f"<b>Last Upload:</b> {last_upload if last_upload else '-'}", styles['Normal']))
         story.append(Paragraph(f"<b>Avg Uploads/Month:</b> {avg_uploads_per_month:.2f}", styles['Normal']))
         story.append(Spacer(1, 20))
         # Charts
-        if 'upload_history' in charts:
+        if 'daily_uploads' in charts:
             story.append(Paragraph("Uploads per Day (Last 30 Days)", styles['Heading3']))
-            story.append(Image(charts['upload_history'], width=6*72, height=2*72))
+            story.append(Image(charts['daily_uploads'], width=6*72, height=2*72))
             story.append(Spacer(1, 10))
         if 'activity_hist' in charts:
             story.append(Paragraph("Upload Activity by Hour", styles['Heading3']))
@@ -703,23 +679,25 @@ async def generate_and_send_individual_report(update: Update, ctx: ContextTypes.
         story.append(Spacer(1, 20))
         story.append(Paragraph("Report generated by CloudVerse Analytics System", styles['Italic']))
         doc.build(story)
-        with open("individual_dashboard_report.pdf", 'rb') as pdf_file:
+        with open("minimalist_report.pdf", 'rb') as pdf_file:
             await ctx.bot.send_document(
                 chat_id=q.from_user.id,
                 document=pdf_file,
-                caption=f"🗃️ Individual Dashboard Report for {first_name} {last_name} (@{username})"
+                caption=f"🗃️ Individual Dashboard Report for {name} (@{username})"
             )
-        await q.edit_message_text("Individual dashboard report sent.")
+        await q.edit_message_text(INDIVIDUAL_REPORT_SENT_MSG)
         import os
-        os.remove("individual_dashboard_report.pdf")
-        log_error(None, context=f"Successfully generated and sent individual report for user {user_id}")
+        os.remove("minimalist_report.pdf")
+        print(f"Successfully generated and sent individual report for user {user_id}")
     except Exception as e:
-        log_error(e, context=f"generate_and_send_individual_report user_id={user_id}")
-        await q.edit_message_text("Failed to generate individual report. Please try again later.")
+        print(f"Error in generate_and_send_individual_report user_id={user_id}: {e}")
+        await q.edit_message_text(FAILED_TO_GENERATE_INDIVIDUAL_REPORT_MSG)
 
 # --- Telegram progress bar and countdown ---
 import asyncio
+@handle_errors
 async def send_report_progress(q, report_type, total_seconds=10):
+    """Send progress updates to the user while the report is being generated."""
     try:
         for i in range(total_seconds):
             percent = int((i+1) / total_seconds * 100)
@@ -728,6 +706,4 @@ async def send_report_progress(q, report_type, total_seconds=10):
             await q.edit_message_text(msg)
             await asyncio.sleep(1)
     except Exception as e:
-        from .Logger import get_logger
-        logger = get_logger()
-        logger.error(f"Error in send_report_progress: {e}") 
+        print(f"Error in send_report_progress: {e}") 

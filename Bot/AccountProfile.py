@@ -4,7 +4,11 @@ from .drive import get_drive_service, get_user_info, get_folder_name
 from datetime import datetime
 from .MainMenu import BACK_BUTTON
 from .Logger import get_logger
+from .Utilities import handle_errors
 logger = get_logger()
+
+# Message constants (user-facing)
+FAILED_TO_LOAD_PROFILE_MSG = "Failed to load profile. Please try again later."
 
 # Define a local account_profile function to format the profile text
 
@@ -20,6 +24,7 @@ def account_profile(user_info, username, telegram_id, email, default_folder_name
         f"Overall Bandwidth: <code>{overall_bandwidth} MB</code>\n"
     )
 
+@handle_errors
 async def handle_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         if update.callback_query and update.callback_query.from_user:
@@ -31,7 +36,6 @@ async def handle_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         user_info = get_user_info(get_drive_service(telegram_id))["user"]
         default_folder_id = user_info["default_folder_id"]
         default_folder_name = get_folder_name(get_drive_service(telegram_id), default_folder_id)
-        # Calculate monthly and overall bandwidth
         current_month = datetime.now().strftime("%Y-%m")
         if update.callback_query and update.callback_query.from_user:
             username = update.callback_query.from_user.username or 'N/A'
@@ -57,6 +61,6 @@ async def handle_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error in handle_profile for user: {locals().get('telegram_id', 'unknown')}: {e}")
         if update.message:
-            await update.message.reply_text("Failed to load profile. Please try again later.")
+            await update.message.reply_text(FAILED_TO_LOAD_PROFILE_MSG)
         elif update.callback_query:
-            await update.callback_query.edit_message_text("Failed to load profile. Please try again later.")
+            await update.callback_query.edit_message_text(FAILED_TO_LOAD_PROFILE_MSG)

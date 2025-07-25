@@ -1,0 +1,14 @@
+youtube.com
+vimeo.com
+dailymotion.com
+facebook.com
+twitter.com
+tiktok.com
+soundcloud.com
+instagram.com
+reddit.com
+odysee.com
+pornhub.com
+xvideos.com
+xhamster.com
+eporner.com

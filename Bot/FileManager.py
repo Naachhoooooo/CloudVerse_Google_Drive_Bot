@@ -1,20 +1,42 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
-from .drive import get_drive_service, list_files, create_folder, rename_file, delete_file, get_file_link, toggle_sharing
-from .Utilities import paginate_list, get_breadcrumb, format_human_size
+from .drive import list_files, create_folder, rename_file, delete_file, get_file_link, toggle_sharing, get_credentials
+from .Utilities import get_breadcrumb, format_human_size, format_size, handle_errors, handle_file_size, handle_folder_size, pagination
 import humanize
 import sqlite3
 from .config import DB_PATH
 import telegram
 from .drive import get_folder_name
-from .Logger import get_logger, log_error
 from typing import Any
-logger = get_logger()
+from .UserState import UserStateEnum
+import googleapiclient.discovery
 
-DEFAULT_PAGE_SIZE = 10  # Configurable default page size for pagination
+DEFAULT_PAGE_SIZE = 10
+
+# Message constants (user-facing)
+FILE_MANAGER_TITLE = "File Manager ({account})\n{breadcrumb}\n\n"
+FOLDER_OPTIONS_BUTTON = "Folder Options ⚙️"
+FOLDER_BUTTON = "📂 {name}"
+FILE_BUTTON = "📄 {name}"
+BACK_BUTTON = "✳️ Back"
+PREV_PAGE_BUTTON = "◀️ Prev"
+NEXT_PAGE_BUTTON = "Next ▶️"
+FAILED_TO_LOAD_FILE_MANAGER_MSG = "Failed to load file manager. Please try again later."
+DEFAULT_UPLOAD_LOCATION_UPDATED_MSG = "Default Upload Location Updated Successfully"
+FAILED_TO_NAVIGATE_FOLDERS_MSG = "Failed to navigate folders. Please try again later."
+FILE_TOOLKIT_TITLE = "File Toolkit:"
+PLEASE_LOGIN_FIRST_MSG = "Please login first."
+SERVICE_UNAVAILABLE_MSG = "Service unavailable. Please try again later."
+FILE_SIZE_MSG = "File size: {size}"
+FAILED_TO_GET_FILE_SIZE_MSG = "Failed to get file size: {error}"
+FOLDER_SIZE_MSG = "Folder size: {size}"
+FAILED_TO_GET_FOLDER_INFO_MSG = "Failed to get folder info: {error}"
+
+# Remove the local definition of paginate_list
+# Use pagination everywhere instead of paginate_list
 
 async def handle_file_manager(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles the file manager UI, paginating files and folders if their count exceeds DEFAULT_PAGE_SIZE."""
+    """Display the file manager UI, paginating files and folders for the user."""
     try:
         if ctx.user_data is None:
             ctx.user_data = {}
@@ -26,7 +48,6 @@ async def handle_file_manager(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         elif m and m.from_user:
             telegram_id = m.from_user.id
         else:
-            logger.warning("handle_file_manager called without user context")
             return
         if "account_data" not in ctx.user_data or ctx.user_data["account_data"] is None:
             ctx.user_data["account_data"] = {}
@@ -37,34 +58,38 @@ async def handle_file_manager(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         if "folder_pages" not in account_data or account_data["folder_pages"] is None:
             account_data["folder_pages"] = {}
         current_folder = account_data["current_folder"]
-        service = get_drive_service(telegram_id, current_account)
+        creds = get_credentials(telegram_id, current_account)
+        if creds:
+            service = googleapiclient.discovery.build('drive', 'v3', credentials=creds)
+        else:
+            service = None
         files, _ = list_files(service, current_folder)
         folders = [f for f in files if f["mimeType"] == "application/vnd.google-apps.folder"]
         files_list = [f for f in files if f["mimeType"] != "application/vnd.google-apps.folder"]
         # Paginate folders and files if needed
         page = ctx.user_data.get("fm_page", 0)
         all_items = folders + files_list
-        paged_items, total_pages, start_idx, end_idx = paginate_list(all_items, page, DEFAULT_PAGE_SIZE)
+        paged_items, total_pages, start_idx, end_idx = pagination(all_items, page, DEFAULT_PAGE_SIZE)
         paged_folders = [item for item in paged_items if item["mimeType"] == "application/vnd.google-apps.folder"]
         paged_files = [item for item in paged_items if item["mimeType"] != "application/vnd.google-apps.folder"]
         breadcrumb = get_breadcrumb(service, account_data['folder_stack'], current_folder, get_folder_name)
-        text = f"File Manager ({current_account})\n{breadcrumb}\n\n"
+        text = FILE_MANAGER_TITLE.format(account=current_account, breadcrumb=breadcrumb)
         buttons = []
-        buttons.append([InlineKeyboardButton("Folder Options ⚙️", callback_data=f"folder_options:{current_folder}")])
-        buttons.extend([[InlineKeyboardButton(f"📂 {f['name']}", callback_data=f"folder:{f['id']}")] for f in paged_folders])
-        buttons.extend([[InlineKeyboardButton(f"📄 {f['name']}", callback_data=f"file:{f['id']}")] for f in paged_files])
+        buttons.append([InlineKeyboardButton(FOLDER_OPTIONS_BUTTON, callback_data=f"folder_options:{current_folder}")])
+        buttons.extend([[InlineKeyboardButton(FOLDER_BUTTON.format(name=f['name']), callback_data=f"folder:{f['id']}")] for f in paged_folders])
+        buttons.extend([[InlineKeyboardButton(FILE_BUTTON.format(name=f['name']), callback_data=f"file:{f['id']}")] for f in paged_files])
         if account_data["folder_stack"]:
-            buttons.append([InlineKeyboardButton("✳️ Back", callback_data="back_folder")])
+            buttons.append([InlineKeyboardButton(BACK_BUTTON, callback_data="back_folder")])
         # Pagination controls
         if total_pages > 1:
             pagination = []
             if page > 0:
-                pagination.append(InlineKeyboardButton("◀️ Prev", callback_data="fm_prev_page"))
+                pagination.append(InlineKeyboardButton(PREV_PAGE_BUTTON, callback_data="fm_prev_page"))
             pagination.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
             if page < total_pages - 1:
-                pagination.append(InlineKeyboardButton("Next ▶️", callback_data="fm_next_page"))
+                pagination.append(InlineKeyboardButton(NEXT_PAGE_BUTTON, callback_data="fm_next_page"))
             buttons.append(pagination)
-        buttons.append([InlineKeyboardButton("✳️ Back", callback_data="back")])
+        buttons.append([InlineKeyboardButton(BACK_BUTTON, callback_data="back")])
         if q:
             try:
                 await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
@@ -73,26 +98,23 @@ async def handle_file_manager(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
                 if isinstance(e, telegram.error.BadRequest) and "Message is not modified" in str(e):
                     pass
                 else:
-                    log_error(e, context=f"handle_file_manager user_id={telegram_id}")
-                    await q.edit_message_text("Failed to load file manager. Please try again later.")
+                    await q.edit_message_text(FAILED_TO_LOAD_FILE_MANAGER_MSG)
         elif m:
             try:
                 await m.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
             except Exception as e:
-                log_error(e, context=f"handle_file_manager user_id={telegram_id}")
-                await m.reply_text("Failed to load file manager. Please try again later.")
-        ctx.user_data["state"] = "FILE_MANAGER"
+                await m.reply_text(FAILED_TO_LOAD_FILE_MANAGER_MSG)
+        ctx.user_data["state"] = UserStateEnum.FILE_MANAGER
         ctx.user_data["fm_total_pages"] = total_pages
         ctx.user_data["fm_page"] = page
-        logger.info(f"User {telegram_id} loaded file manager successfully. Files: {len(files)}")
     except Exception as e:
-        log_error(e, context=f"handle_file_manager user_id={locals().get('telegram_id', 'unknown')}")
         if 'q' in locals() and q and hasattr(q, 'edit_message_text'):
-            await q.edit_message_text("Failed to load file manager. Please try again later.")
+            await q.edit_message_text(FAILED_TO_LOAD_FILE_MANAGER_MSG)
         elif 'm' in locals() and m:
-            await m.reply_text("Failed to load file manager. Please try again later.")
+            await m.reply_text(FAILED_TO_LOAD_FILE_MANAGER_MSG)
 
 async def handle_folder_navigation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle navigation between folders, updating the current folder and stack as needed."""
     try:
         if ctx.user_data is None:
             ctx.user_data = {}
@@ -110,7 +132,11 @@ async def handle_folder_navigation(update: Update, ctx: ContextTypes.DEFAULT_TYP
         account_data = ctx.user_data["account_data"].setdefault(current_account, {"current_folder": "root", "folder_stack": [], "folder_pages": {}})
         if "folder_pages" not in account_data or account_data["folder_pages"] is None:
             account_data["folder_pages"] = {}
-        service = get_drive_service(telegram_id, current_account)
+        creds = get_credentials(telegram_id, current_account)
+        if creds:
+            service = googleapiclient.discovery.build('drive', 'v3', credentials=creds)
+        else:
+            service = None
         data = q.data if q else (m.text if m else "")
         if not isinstance(data, str):
             return
@@ -125,7 +151,7 @@ async def handle_folder_navigation(update: Update, ctx: ContextTypes.DEFAULT_TYP
                 conn.close()
                 ctx.user_data.pop("in_def_location")
                 if q and hasattr(q, 'edit_message_text'):
-                    await q.edit_message_text("Default Upload Location Updated Successfully")
+                    await q.edit_message_text(DEFAULT_UPLOAD_LOCATION_UPDATED_MSG)
             else:
                 account_data["folder_stack"].append(account_data["current_folder"])
                 account_data["current_folder"] = folder_id
@@ -153,13 +179,13 @@ async def handle_folder_navigation(update: Update, ctx: ContextTypes.DEFAULT_TYP
             ctx.user_data["account_data"].setdefault(new_account, {"current_folder": "root", "folder_stack": [], "folder_pages": {}})
             await handle_file_manager(update, ctx)
     except Exception as e:
-        log_error(e, context=f"handle_folder_navigation user_id={locals().get('telegram_id', 'unknown')}")
         if 'q' in locals() and q and hasattr(q, 'edit_message_text'):
-            await q.edit_message_text("Failed to navigate folders. Please try again later.")
+            await q.edit_message_text(FAILED_TO_NAVIGATE_FOLDERS_MSG)
         elif 'm' in locals() and m:
-            await m.reply_text("Failed to navigate folders. Please try again later.")
+            await m.reply_text(FAILED_TO_NAVIGATE_FOLDERS_MSG)
 
 async def handle_file_selection(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Display file options (rename, delete, copy link, size) for the selected file."""
     try:
         if ctx.user_data is None:
             ctx.user_data = {}
@@ -172,7 +198,11 @@ async def handle_file_selection(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             return
         current_account = ctx.user_data.get("current_account")
-        service = get_drive_service(telegram_id, current_account)
+        creds = get_credentials(telegram_id, current_account)
+        if creds:
+            service = googleapiclient.discovery.build('drive', 'v3', credentials=creds)
+        else:
+            service = None
         data = q.data if q else (m.text if m else "")
         if isinstance(data, str) and data.startswith("file:"):
             file_id = data.split("file:")[1]
@@ -184,12 +214,38 @@ async def handle_file_selection(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("✳️ Back", callback_data="back_to_folder")]
             ]
             if q and hasattr(q, 'edit_message_text'):
-                await q.edit_message_text("File Toolkit:", reply_markup=InlineKeyboardMarkup(buttons))
-        elif isinstance(data, str) and data.startswith("folder_options:"):
+                await q.edit_message_text(FILE_TOOLKIT_TITLE, reply_markup=InlineKeyboardMarkup(buttons))
+    except Exception as e:
+        if 'q' in locals() and q and hasattr(q, 'edit_message_text'):
+            await q.edit_message_text("Failed to select file. Please try again later.")
+        elif 'm' in locals() and m:
+            await m.reply_text("Failed to select file. Please try again later.")
+
+async def handle_folder_selection(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Display folder options (rename, delete, copy link, toggle sharing, new folder, size) for the selected folder."""
+    try:
+        if ctx.user_data is None:
+            ctx.user_data = {}
+        q = update.callback_query if hasattr(update, 'callback_query') and update.callback_query else None
+        m = update.message if hasattr(update, 'message') and update.message else None
+        if q and q.from_user:
+            telegram_id = q.from_user.id
+        elif m and m.from_user:
+            telegram_id = m.from_user.id
+        else:
+            return
+        current_account = ctx.user_data.get("current_account")
+        creds = get_credentials(telegram_id, current_account)
+        if creds:
+            service = googleapiclient.discovery.build('drive', 'v3', credentials=creds)
+        else:
+            service = None
+        data = q.data if q else (m.text if m else "")
+        if isinstance(data, str) and data.startswith("folder_options:"):
             folder_id = data.split("folder_options:")[1]
             if not service:
                 if q and hasattr(q, 'edit_message_text'):
-                    await q.edit_message_text("Please login first.")
+                    await q.edit_message_text(PLEASE_LOGIN_FIRST_MSG)
                 return
             permissions = service.permissions().list(fileId=folder_id).execute().get('permissions', [])
             sharing_status = "ON 🟢" if any(perm['type'] == 'anyone' for perm in permissions) else "OFF 🔴"
@@ -205,14 +261,13 @@ async def handle_file_selection(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if q and hasattr(q, 'edit_message_text'):
                 await q.edit_message_text("Folder Toolkit:", reply_markup=InlineKeyboardMarkup(buttons))
     except Exception as e:
-        log_error(e, context=f"handle_file_selection user_id={locals().get('telegram_id', 'unknown')}")
         if 'q' in locals() and q and hasattr(q, 'edit_message_text'):
-            await q.edit_message_text("Failed to select file or folder. Please try again later.")
+            await q.edit_message_text("Failed to select folder. Please try again later.")
         elif 'm' in locals() and m:
-            await m.reply_text("Failed to select file or folder. Please try again later.")
+            await m.reply_text("Failed to select folder. Please try again later.")
 
-async def handle_file_actions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handles file actions (rename, delete, etc.) in the file manager."""
+async def handle_file_operation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle file operations such as rename, delete, confirm delete, copy link, and show file size."""
     try:
         if ctx.user_data is None:
             ctx.user_data = {}
@@ -225,7 +280,11 @@ async def handle_file_actions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             return
         current_account = ctx.user_data.get("current_account")
-        service = get_drive_service(telegram_id, current_account)
+        creds = get_credentials(telegram_id, current_account)
+        if creds:
+            service = googleapiclient.discovery.build('drive', 'v3', credentials=creds)
+        else:
+            service = None
         data = q.data if q else (m.text if m else "")
         if isinstance(data, str) and data.startswith("rename_file:"):
             file_id = data.split("rename_file:")[1]
@@ -250,7 +309,33 @@ async def handle_file_actions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             link = get_file_link(service, file_id)
             if q and hasattr(q, 'edit_message_text'):
                 await q.edit_message_text(f"Link: {link}")
-        elif isinstance(data, str) and data.startswith("rename_folder:"):
+    except Exception as e:
+        if 'q' in locals() and q and hasattr(q, 'edit_message_text'):
+            await q.edit_message_text("Failed to perform file operation. Please try again later.")
+        elif 'm' in locals() and m:
+            await m.reply_text("Failed to perform file operation. Please try again later.")
+
+async def handle_folder_operation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle folder operations such as rename, delete, confirm delete, copy link, toggle sharing, new folder, and show folder size."""
+    try:
+        if ctx.user_data is None:
+            ctx.user_data = {}
+        q = update.callback_query if hasattr(update, 'callback_query') and update.callback_query else None
+        m = update.message if hasattr(update, 'message') and update.message else None
+        if q and q.from_user:
+            telegram_id = q.from_user.id
+        elif m and m.from_user:
+            telegram_id = m.from_user.id
+        else:
+            return
+        current_account = ctx.user_data.get("current_account")
+        creds = get_credentials(telegram_id, current_account)
+        if creds:
+            service = googleapiclient.discovery.build('drive', 'v3', credentials=creds)
+        else:
+            service = None
+        data = q.data if q else (m.text if m else "")
+        if isinstance(data, str) and data.startswith("rename_folder:"):
             folder_id = data.split("rename_folder:")[1]
             if q and hasattr(q, 'edit_message_text'):
                 await q.edit_message_text("Enter new folder name:")
@@ -268,63 +353,31 @@ async def handle_file_actions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             delete_file(service, folder_id)
             if q and hasattr(q, 'edit_message_text'):
                 await q.edit_message_text("Folder moved to Recycle Bin.")
+        elif isinstance(data, str) and data.startswith("copy_link:"):
+            folder_id = data.split("copy_link:")[1]
+            link = get_file_link(service, folder_id)
+            if q and hasattr(q, 'edit_message_text'):
+                await q.edit_message_text(f"Link: {link}")
         elif isinstance(data, str) and data.startswith("toggle_sharing:"):
-            file_id = data.split("toggle_sharing:")[1]
-            toggle_sharing(service, file_id)
+            folder_id = data.split("toggle_sharing:")[1]
+            toggle_sharing(service, folder_id)
             if q and hasattr(q, 'edit_message_text'):
                 await q.edit_message_text("Sharing toggled.")
-            await handle_file_selection(update, ctx)  # Refresh to show updated status
+            await handle_folder_selection(update, ctx)  # Refresh to show updated status
         elif isinstance(data, str) and data.startswith("new_folder:"):
             folder_id = data.split("new_folder:")[1]
             if q and hasattr(q, 'edit_message_text'):
                 await q.edit_message_text("Enter new folder name:")
             ctx.user_data["next_action"] = f"create_folder:{folder_id}"
-        elif isinstance(data, str) and data.startswith("file_size:"):
-            file_id = data.split(":")[1]
-            # Defensive fix for service.files
-            if service and hasattr(service, 'files'):
-                file = service.files().get(fileId=file_id, fields="size, name").execute()
-                size = int(file.get("size", 0))
-                size_str = format_human_size(size)
-                msg = f"Size of {file['name']}: {size_str}"
-                if q:
-                    await q.answer(msg, show_alert=True)
-                elif m:
-                    await m.reply_text(msg)
-        elif isinstance(data, str) and data.startswith("folder_size:"):
-            folder_id = data.split(":")[1]
-            total_size = 0
-            stack = [folder_id]
-            while stack:
-                current = stack.pop()
-                files, _ = list_files(service, current)
-                for f in files:
-                    if f["mimeType"] == "application/vnd.google-apps.folder":
-                        stack.append(f["id"])
-                    else:
-                        if service and hasattr(service, 'files'):
-                            file_meta = service.files().get(fileId=f["id"], fields="size").execute()
-                            total_size += int(file_meta.get("size", 0))
-            size_str = format_human_size(total_size)
-            msg = f"Total size of folder: {size_str}"
-            if q:
-                await q.answer(msg, show_alert=True)
-            elif m:
-                await m.reply_text(msg)
-        elif isinstance(data, str) and data == "back_to_folder":
-            await handle_file_manager(update, ctx)
     except Exception as e:
-        log_error(e, context=f"handle_file_actions user_id={locals().get('telegram_id', 'unknown')}")
         if 'q' in locals() and q and hasattr(q, 'edit_message_text'):
-            await q.edit_message_text("Failed to perform file action. Please try again later.")
+            await q.edit_message_text("Failed to perform folder operation. Please try again later.")
         elif 'm' in locals() and m:
-            await m.reply_text("Failed to perform file action. Please try again later.")
+            await m.reply_text("Failed to perform folder operation. Please try again later.")
 
 # Add handlers for pagination navigation
 async def handle_fm_pagination(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handles pagination for the file manager.
-    """
+    """Handle pagination for the file manager view."""
     if ctx.user_data is None:
         ctx.user_data = {}
     q = update.callback_query

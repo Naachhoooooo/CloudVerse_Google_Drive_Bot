@@ -2,27 +2,39 @@ import sqlite3
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from .config import GROUP_CHAT_ID, TeamCloudverse_TOPIC_ID, DB_PATH
 from datetime import datetime
-from .Logger import get_logger
+from .Utilities import handle_errors
 from .database import update_pending_user_group_message, get_pending_user_group_message, clear_pending_user_group_message
-logger = get_logger()
 
-# --- Centralized TeamCloudverse Group Chat Utilities ---
+BOT_NAME_LINE = "Bot : CloudVerse Google Drive Bot"
+NAME_LINE = "Name: {first_name} {last_name}"
+USERNAME_LINE = "Username: @{username}"
+ID_LINE = "ID: {telegram_id}"
+REQUEST_STATUS_APPROVED = "Request Status : Approved"
+REQUEST_STATUS_REJECTED = "Request Status : Rejected"
+REQUEST_STATUS_LIMITED = "Request Status : Limited Access ({hours} hours)"
+REQUEST_STATUS_UPDATED = "Request Status : {status}"
+TIMESTAMP_LINE = "Timestamp: {timestamp}"
+APPROVED_BY_BUTTON = "✅ Approved by @{admin_username}"
+REJECTED_BY_BUTTON = "❌ Rejected by @{admin_username}"
+LIMITED_BY_BUTTON = "⏳ Limited by @{admin_username}"
+UPDATED_BY_BUTTON = "Updated by @{admin_username}"
+BAN_STATUS_LINE = "Ban Status : {ban_status}"
+BAN_TYPE_LINE = "Ban Type : {ban_type}"
+BANNED_BY_BUTTON = "⛔️ Banned by @{admin_username}"
+BAN_CANCELLED_BY_BUTTON = "❎ Ban Cancelled by @{admin_username}"
+BROADCAST_REQUEST_TITLE = "🎙️ **Broadcast Request**\n\n"
+APPROVE_BROADCAST_BUTTON = "🟢 Approve"
+REJECT_BROADCAST_BUTTON = "🔴 Reject (Super Admin Only)"
 
 def get_group_ids():
+    """Return the group and topic IDs for TeamCloudverse group chat. Raises if not configured."""
     if GROUP_CHAT_ID is None or TeamCloudverse_TOPIC_ID is None:
-        logger.error("get_group_ids called but group or topic ID is not configured", extra={"operation": "get_group_ids"})
         raise ValueError("Group chat or topic ID not configured.")
-    logger.info(f"Fetched group IDs: GROUP_CHAT_ID={GROUP_CHAT_ID}, TeamCloudverse_TOPIC_ID={TeamCloudverse_TOPIC_ID}", extra={"operation": "get_group_ids"})
     return int(GROUP_CHAT_ID), int(TeamCloudverse_TOPIC_ID)
 
-# --- Unified Handlers ---
-
+@handle_errors
 async def handle_access_request(ctx, action, data):
-    """
-    Unified handler for access requests in the TeamCloudverse group.
-    action: 'request', 'approve', 'reject', 'limit', 'update'
-    data: dict with user info, admin info, message, etc.
-    """
+    """Unified handler for access requests in the TeamCloudverse group (request, approve, reject, limit, update)."""
     chat_id, topic_id = get_group_ids()
     telegram_id = data.get('telegram_id')
     username = data.get('username')
@@ -35,11 +47,14 @@ async def handle_access_request(ctx, action, data):
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     if action == 'request':
         user_info = (
-            f"Bot : CloudVerse Google Drive Bot\n"
-            f"Name: {first_name} {last_name}\n"
-            f"Username: @{username or 'N/A'}\n"
-            f"ID: {telegram_id}"
+            BOT_NAME_LINE + "\n"
+            + NAME_LINE.format(first_name=first_name, last_name=last_name) + "\n"
+            + USERNAME_LINE.format(username=username or 'N/A') + "\n"
+            + ID_LINE.format(telegram_id=telegram_id)
         )
+        # Add custom message (e.g., expired user note)
+        if message:
+            user_info += f"\n{message}"
         buttons = [
             [InlineKeyboardButton("⏰ Limited Access", callback_data=f"access_limit:{telegram_id}"),
              InlineKeyboardButton("✅ Approve", callback_data=f"access_approve:{telegram_id}"),
@@ -55,7 +70,7 @@ async def handle_access_request(ctx, action, data):
             # Store mapping in DB
             update_pending_user_group_message(telegram_id, msg.message_id)
         except Exception as e:
-            logger.error("Failed to post access request to group topic: %s", e)
+            pass
     elif action in ('approve', 'reject', 'limit', 'update'):
         # Update group message after action
         row = get_pending_user_group_message(telegram_id)
@@ -63,27 +78,27 @@ async def handle_access_request(ctx, action, data):
             message_id = row
             try:
                 details = (
-                    f"Name: {first_name} {last_name}\n"
-                    f"Username: @{username or 'N/A'}\n"
-                    f"ID: {telegram_id}\n\n"
-                    f"Bot : CloudVerse Google Drive Bot\n"
+                    NAME_LINE.format(first_name=first_name, last_name=last_name) + "\n"
+                    + USERNAME_LINE.format(username=username or 'N/A') + "\n"
+                    + ID_LINE.format(telegram_id=telegram_id) + "\n\n"
+                    + BOT_NAME_LINE + "\n"
                 )
                 if action == 'approve':
-                    details += f"Request Status : Approved\n"
-                    details += f"Timestamp: {timestamp}"
-                    status_button = [[InlineKeyboardButton(f"✅ Approved by @{admin_username}", callback_data="noop")]]
+                    details += REQUEST_STATUS_APPROVED + "\n"
+                    details += TIMESTAMP_LINE.format(timestamp=timestamp)
+                    status_button = [[InlineKeyboardButton(APPROVED_BY_BUTTON.format(admin_username=admin_username), callback_data="noop")]]
                 elif action == 'reject':
-                    details += f"Request Status : Rejected\n"
-                    details += f"Timestamp: {timestamp}"
-                    status_button = [[InlineKeyboardButton(f"❌ Rejected by @{admin_username}", callback_data="noop")]]
+                    details += REQUEST_STATUS_REJECTED + "\n"
+                    details += TIMESTAMP_LINE.format(timestamp=timestamp)
+                    status_button = [[InlineKeyboardButton(REJECTED_BY_BUTTON.format(admin_username=admin_username), callback_data="noop")]]
                 elif action == 'limit':
-                    details += f"Request Status : Limited Access ({hours} hours)\n"
-                    details += f"Timestamp: {timestamp}"
-                    status_button = [[InlineKeyboardButton(f"⏳ Limited by @{admin_username}", callback_data="noop")]]
+                    details += REQUEST_STATUS_LIMITED.format(hours=hours) + "\n"
+                    details += TIMESTAMP_LINE.format(timestamp=timestamp)
+                    status_button = [[InlineKeyboardButton(LIMITED_BY_BUTTON.format(admin_username=admin_username), callback_data="noop")]]
                 else:
-                    details += f"Request Status : {status or 'Updated'}\n"
-                    details += f"Timestamp: {timestamp}"
-                    status_button = [[InlineKeyboardButton(f"Updated by @{admin_username}", callback_data="noop")]]
+                    details += REQUEST_STATUS_UPDATED.format(status=status or 'Updated') + "\n"
+                    details += TIMESTAMP_LINE.format(timestamp=timestamp)
+                    status_button = [[InlineKeyboardButton(UPDATED_BY_BUTTON.format(admin_username=admin_username), callback_data="noop")]]
                 await ctx.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=message_id,
@@ -91,16 +106,13 @@ async def handle_access_request(ctx, action, data):
                     reply_markup=InlineKeyboardMarkup(status_button)
                 )
             except Exception as e:
-                logger.error(f"Failed to update access group message: {e}")
+                pass
             # Remove the mapping after handling
             clear_pending_user_group_message(telegram_id)
 
+@handle_errors
 async def handle_ban_request(ctx, action, data):
-    """
-    Unified handler for ban requests in the TeamCloudverse group.
-    action: 'request', 'ban', 'cancel', 'update'
-    data: dict with user info, ban info, admin info, etc.
-    """
+    """Unified handler for ban requests in the TeamCloudverse group (request, ban, cancel, update)."""
     chat_id, topic_id = get_group_ids()
     telegram_id = data.get('telegram_id')
     username = data.get('username')
@@ -112,11 +124,10 @@ async def handle_ban_request(ctx, action, data):
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     if action == 'request':
         user_info = (
-            f"*Ban Request forwarded from Logger frontend*\n\n"
-            f"Bot : CloudVerse Google Drive Bot\n"
-            f"Name: {name}\n"
-            f"Username: @{username or 'N/A'}\n"
-            f"ID: {telegram_id}"
+            BOT_NAME_LINE + "\n"
+            + NAME_LINE.format(first_name=name, last_name="") + "\n"
+            + USERNAME_LINE.format(username=username or 'N/A') + "\n"
+            + ID_LINE.format(telegram_id=telegram_id)
         )
         buttons = [
             [InlineKeyboardButton("🚫Ban user", callback_data=f"ban_user_menu:{telegram_id}")]
@@ -132,7 +143,7 @@ async def handle_ban_request(ctx, action, data):
             # Store mapping in DB
             update_pending_user_group_message(telegram_id, msg.message_id)
         except Exception as e:
-            logger.error("Failed to post ban request to group topic: %s", e)
+            pass
     elif action in ('ban', 'cancel', 'update'):
         # Update group message after ban action
         row = get_pending_user_group_message(telegram_id)
@@ -140,21 +151,21 @@ async def handle_ban_request(ctx, action, data):
             message_id = row
             try:
                 details = (
-                    f"Name: {name}\n"
-                    f"Username: @{username or 'N/A'}\n"
-                    f"ID: {telegram_id}\n\n"
-                    f"Bot : CloudVerse Google Drive Bot\n"
-                    f"Ban Status : {ban_status}\n"
+                    NAME_LINE.format(first_name=name, last_name="") + "\n"
+                    + USERNAME_LINE.format(username=username or 'N/A') + "\n"
+                    + ID_LINE.format(telegram_id=telegram_id) + "\n\n"
+                    + BOT_NAME_LINE + "\n"
+                    + BAN_STATUS_LINE.format(ban_status=ban_status) + "\n"
                 )
                 if ban_status != "Cancelled" and ban_type:
-                    details += f"Ban Type : {ban_type}\n"
-                details += f"Timestamp: {timestamp}"
+                    details += BAN_TYPE_LINE.format(ban_type=ban_type) + "\n"
+                details += TIMESTAMP_LINE.format(timestamp=timestamp)
                 if action == 'ban':
-                    status_button = [[InlineKeyboardButton(f"⛔️ Banned by @{admin_username}", callback_data="noop")]]
+                    status_button = [[InlineKeyboardButton(BANNED_BY_BUTTON.format(admin_username=admin_username), callback_data="noop")]]
                 elif action == 'cancel':
-                    status_button = [[InlineKeyboardButton(f"❎ Ban Cancelled by @{admin_username}", callback_data="noop")]]
+                    status_button = [[InlineKeyboardButton(BAN_CANCELLED_BY_BUTTON.format(admin_username=admin_username), callback_data="noop")]]
                 else:
-                    status_button = [[InlineKeyboardButton(f"Updated by @{admin_username}", callback_data="noop")]]
+                    status_button = [[InlineKeyboardButton(UPDATED_BY_BUTTON.format(admin_username=admin_username), callback_data="noop")]]
                 await ctx.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=message_id,
@@ -162,16 +173,13 @@ async def handle_ban_request(ctx, action, data):
                     reply_markup=InlineKeyboardMarkup(status_button)
                 )
             except Exception as e:
-                logger.error(f"Failed to update ban group message: {e}")
+                pass
             # Remove the mapping after handling
             clear_pending_user_group_message(telegram_id)
 
+@handle_errors
 async def handle_broadcast_request(ctx, action, data):
-    """
-    Unified handler for broadcast requests in the TeamCloudverse group.
-    action: 'request', 'approve', 'reject', 'update'
-    data: dict with broadcast info, admin info, etc.
-    """
+    """Unified handler for broadcast requests in the TeamCloudverse group (request, approve, reject, update)."""
     chat_id, topic_id = get_group_ids()
     request_id = data.get('request_id')
     message = data.get('message')
@@ -182,10 +190,10 @@ async def handle_broadcast_request(ctx, action, data):
     status = data.get('status')
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     if action == 'request':
-        group_text = f"🎙️ **Broadcast Request**\n\n{message}"
+        group_text = BROADCAST_REQUEST_TITLE + message
         buttons = [
-            [InlineKeyboardButton("🟢 Approve", callback_data=f"approve_broadcast:{request_id}"),
-             InlineKeyboardButton("🔴 Reject (Super Admin Only)", callback_data=f"reject_broadcast:{request_id}")]
+            [InlineKeyboardButton(APPROVE_BROADCAST_BUTTON, callback_data=f"approve_broadcast:{request_id}"),
+             InlineKeyboardButton(REJECT_BROADCAST_BUTTON, callback_data=f"reject_broadcast:{request_id}")]
         ]
         try:
             if media_type == "text" or not media_type:
@@ -240,7 +248,7 @@ async def handle_broadcast_request(ctx, action, data):
             if request_id:
                 update_pending_user_group_message(request_id, msg.message_id)
         except Exception as e:
-            logger.error("Failed to post broadcast to group topic: %s", e)
+            pass
     elif action in ('approve', 'reject', 'update'):
         # Update group message after action
         row = get_pending_user_group_message(request_id)
@@ -266,11 +274,12 @@ async def handle_broadcast_request(ctx, action, data):
                     reply_markup=InlineKeyboardMarkup(status_button)
                 )
             except Exception as e:
-                logger.error(f"Failed to update broadcast group message: {e}")
+                pass
             # Remove the mapping after handling
             clear_pending_user_group_message(request_id)
 
 # --- Reports remain as is ---
+@handle_errors
 async def post_report(ctx, pdf_path, report_type, username):
     chat_id, topic_id = get_group_ids()
     try:
@@ -282,9 +291,10 @@ async def post_report(ctx, pdf_path, report_type, username):
                 message_thread_id=topic_id
             )
     except Exception as e:
-        logger.error(f"Failed to send {report_type} report to group topic: {e}")
+        pass
 
 # --- Deprecated wrappers for backward compatibility ---
+@handle_errors
 async def post_access_request(ctx, telegram_id, username, first_name, last_name):
     await handle_access_request(ctx, 'request', {
         'telegram_id': telegram_id,
@@ -293,6 +303,7 @@ async def post_access_request(ctx, telegram_id, username, first_name, last_name)
         'last_name': last_name
     })
 
+@handle_errors
 async def post_ban_request(ctx, telegram_id, username, name):
     await handle_ban_request(ctx, 'request', {
         'telegram_id': telegram_id,
@@ -300,6 +311,7 @@ async def post_ban_request(ctx, telegram_id, username, name):
         'name': name
     })
 
+@handle_errors
 async def post_broadcast(ctx, text, media_type=None, media_file_id=None, request_id=None, user_count=None):
     await handle_broadcast_request(ctx, 'request', {
         'request_id': request_id,
@@ -309,6 +321,7 @@ async def post_broadcast(ctx, text, media_type=None, media_file_id=None, request
         'user_count': user_count
     })
 
+@handle_errors
 async def update_group_ban_message_status(telegram_id, name, username, ban_status, ban_type, admin_username, ctx, status_button=None):
     await handle_ban_request(ctx, 'ban', {
         'telegram_id': telegram_id,

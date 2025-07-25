@@ -11,30 +11,24 @@ import requests
 import re
 import io
 import json
-from .Logger import get_logger
-logger = get_logger()
+from .database import get_drive_credentials, set_drive_credentials, remove_drive_credentials
 
-def get_drive_service(telegram_id, account_email=None):
-    try:
-        # token_json = get_token_json_for_drive_service(telegram_id, account_email) # This line is removed
-        # if token_json: # This line is removed
-        #     decrypted_token = CIPHER.decrypt(token_json.encode()).decode() # This line is removed
-        #     creds = Credentials.from_authorized_user_info(json.loads(decrypted_token), SCOPES) # This line is removed
-        #     if creds.expired and creds.refresh_token: # This line is removed
-        #         creds.refresh(Request()) # This line is removed
-        #     return build("drive", "v3", credentials=creds) # This line is removed
-        # return None # This line is removed
-        # The following lines are added to handle the case where get_token_json_for_drive_service is removed
-        # This is a placeholder and will need to be replaced with actual credential handling
-        # For now, we'll return a dummy service or raise an error if credentials are not available
-        # In a real scenario, you would load credentials from a secure storage or database
-        # For demonstration, we'll return a dummy service
-        logger.warning("get_token_json_for_drive_service is no longer available. Returning a dummy service.")
-        creds = Credentials.from_authorized_user_info({"access_token": "dummy_access_token", "refresh_token": "dummy_refresh_token", "token_uri": "https://oauth2.googleapis.com/token", "client_id": "dummy_client_id", "client_secret": "dummy_client_secret", "scopes": SCOPES}, SCOPES)
-        return build("drive", "v3", credentials=creds)
-    except Exception as e:
-        logger.error(f"Failed to get drive service: {e}")
+def get_credentials(telegram_id, account_email):
+    creds_dict = get_drive_credentials(telegram_id, account_email)
+    if not creds_dict:
         return None
+    from google.oauth2.credentials import Credentials
+    from .config import SCOPES
+    try:
+        return Credentials.from_authorized_user_info(creds_dict, SCOPES)
+    except Exception:
+        return None
+
+def set_credentials(telegram_id, account_email, credentials_dict):
+    set_drive_credentials(telegram_id, account_email, credentials_dict)
+
+def remove_credentials(telegram_id, account_email):
+    return remove_drive_credentials(telegram_id, account_email)
 
 def get_folder_name(service, folder_id):
     if folder_id == "root":
@@ -43,7 +37,6 @@ def get_folder_name(service, folder_id):
         folder = service.files().get(fileId=folder_id, fields="name").execute()
         return folder["name"]
     except Exception as e:
-        logger.error(f"Failed to get folder name: {e}")
         return "Unknown"
 
 def list_files(service, folder_id="root", page_token=None, page_size=10):
@@ -103,7 +96,6 @@ def upload_file(service, local_path, parent_id=None, progress_callback=None):
                     progress_callback(status.resumable_progress, status.total_size)
         return response
     except Exception as e:
-        logger.error(f"Upload failed: {e}")
         raise
 
 def upload_from_url(service, url, parent_id=None, progress_callback=None):
@@ -128,7 +120,6 @@ def upload_from_url(service, url, parent_id=None, progress_callback=None):
                     progress_callback(status.resumable_progress, status.total_size)
         return response
     except Exception as e:
-        logger.error(f"URL upload failed: {e}")
         raise
 
 def extract_drive_file_id(url):
@@ -136,7 +127,6 @@ def extract_drive_file_id(url):
     return match.group(1) if match else None
 
 def search_files(service, query, page_token=None, page_size=10):
-    # Use correct Google Drive query format for name search
     drive_query = f"name contains '{query}' and trashed=false"
     res = service.files().list(q=drive_query, pageToken=page_token, pageSize=page_size,
                               fields="nextPageToken, files(id,name,mimeType)").execute()

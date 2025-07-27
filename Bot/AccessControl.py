@@ -1,3 +1,29 @@
+"""
+CloudVerse Google Drive Bot - Access Control Module
+
+This module handles all aspects of user access control and permission management
+for the CloudVerse Google Drive Bot. It provides comprehensive functionality for
+managing user roles, permissions, and access requests.
+
+Key Features:
+- Multi-tier access control (Super Admin, Admin, Whitelist, Blacklist)
+- User access request processing and approval workflow
+- Temporary and permanent access restrictions
+- Paginated user management interfaces
+- Real-time access status monitoring
+- Integration with admin notification system
+
+Access Hierarchy:
+1. Super Admins: Full system control, can manage all users and admins
+2. Admins: Can manage whitelist users and handle access requests
+3. Whitelisted Users: Have access to bot features with optional time limits
+4. Blacklisted Users: Restricted from using the bot (temporary or permanent)
+5. Pending Users: Awaiting approval for bot access
+
+Author: CloudVerse Team
+License: Open Source
+"""
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from .database import (
@@ -13,19 +39,29 @@ from .TeamCloudverse import handle_access_request as teamcloudverse_handle_acces
 from typing import Any
 from enum import Enum
 
-# Message constants (user-facing)
+from .Logger import security_logger as logger
+
+# ============================================================================
+# USER INTERFACE CONSTANTS - Messages and labels for consistent UX
+# ============================================================================
+
+# Main interface titles and headers
 ACCESS_CONTROL_TITLE = "Access Control"
 FAILED_TO_LOAD_ACCESS_CONTROL = "Failed to load Access Control"
 SUPER_ADMIN_LIST_TITLE = "👑 Super Admin List"
 ADMIN_LIST_TITLE = "⭐ Admin List"
 WHITELISTED_USERS_TITLE = "📃 Whitelisted Users"
 BLACKLISTED_USERS_TITLE = "🚫 Blacklisted Users"
+
+# Error messages for list loading failures
 FAILED_TO_LOAD_SUPER_ADMIN_LIST = "Failed to load super admin list. Please try again later."
 FAILED_TO_LOAD_ADMIN_LIST = "Failed to load admin list. Please try again later."
 FAILED_TO_LOAD_WHITELIST = "Failed to load whitelist. Please try again later."
 FAILED_TO_LOAD_BLACKLIST = "Failed to load blacklist. Please try again later."
 NO_BLACKLISTED_USERS_MSG = "No users are currently blacklisted."
 FAILED_TO_LOAD_REQUESTS = "Failed to load requests"
+
+# User restriction management messages
 USER_UNRESTRICTED_MSG = "User {telegram_id} has been unrestricted."
 FAILED_TO_UNRESTRICT_USER = "Failed to unrestrict user."
 EDIT_RESTRICTION_PROMPT = "Edit restriction for user {telegram_id}:\nChoose restriction type:"
@@ -35,11 +71,15 @@ RESTRICTION_SET_PERMANENT = "Restriction for user {telegram_id} set to Permanent
 FAILED_TO_SET_RESTRICTION_TYPE = "Failed to set restriction type."
 RESTRICTION_SET_TEMPORARY = "Restriction for user {telegram_id} set to Temporary for {hours} hours."
 FAILED_TO_SET_RESTRICTION_DURATION = "Failed to set restriction duration. Please enter a valid number of hours."
+
+# Access request processing messages
 ACCESS_APPROVED_MSG = "Access approved for user @{username} (ID: {user_id})."
 ACCESS_REJECTED_MSG = "Access rejected for user @{username} (ID: {user_id})."
 FAILED_TO_PROCESS_REQUEST_ACTION = "Failed to process request action. Please try again later."
 DEFAULT_ACCESS_REQUEST_MSG = "Your access request to use the bot has been {status} by Team CloudVerse"
 DEFAULT_MESSAGE_SENT_TO_USER = "Default message sent to the user."
+
+# User management input prompts
 ENTER_NEW_ADMIN_USERNAME = "Enter the username of the new admin (e.g., @username):"
 ADMIN_REMOVED_MSG = "Admin with ID {admin_id} has been removed."
 FAILED_TO_REMOVE_ADMIN = "❌ {error}"
@@ -49,16 +89,23 @@ ENTER_TIME_LIMIT_FOR_USER = "Enter the time limit in hours for user {user} (eg:3
 ENTER_NUMBER_OF_HOURS_LIMITED_ACCESS = "Enter the number of hours for limited access:"
 SEND_OPTIONAL_WELCOME_MESSAGE = "Send an optional welcome message to the user, or click Skip."
 
-DEFAULT_PAGE_SIZE = 5
+# Configuration constants
+DEFAULT_PAGE_SIZE = 10  # Number of users to display per page in lists
+
+# Access control messages
 ACCESS_DENIED_MSG = "Access Denied : You are not authorised to perform this action\n\nContact *Team CloudVerse* for more"
 SUPER_ADMIN_DENIED_MSG = "Access Denied : Only super admins can perform this action\n\nContact *Team CloudVerse* for more"
 REJECTION_MSG = "Your access request to use the bot has been rejected by *Team CloudVerse* for professional reasons"
+
+# Welcome messages for new users
 WELCOME_MSG = (
     "🎉 Welcome to *CloudVerse Google Drive Bot*\n\n"
     "your seamless solution for managing *Google Drive* directly from *Telegram* with various other functionalities\n\n"
     "Review the *Terms and Conditions* before getting started\n\n"
     "Reach out to *CloudVerse Support Team* anytime for assistance"
 )
+
+# Limited access messages
 LIMITED_ACCESS_NEW_MSG = (
     "Your access request to use the bot has been approved by *Team CloudVerse* for *{hours} hours*\n\n"
     "🎉 Welcome to *CloudVerse Google Drive Bot*\n\n"
@@ -68,22 +115,80 @@ LIMITED_ACCESS_NEW_MSG = (
 )
 LIMITED_ACCESS_EXISTING_MSG = "Your access to the bot has been modified by *Team  CloudVerse* to {hours} hour(s)"
 
+# ============================================================================
+# ENUMERATIONS - Type definitions for user roles and access levels
+# ============================================================================
+
 class UserRole(Enum):
+    """
+    Enumeration defining the different user roles in the access control system.
+    
+    Roles:
+        ADMIN: Regular administrator with user management capabilities
+        SUPER_ADMIN: Super administrator with full system control
+        WHITELIST: Regular user with bot access (may have time limits)
+        BLACKLIST: Restricted user without bot access
+    """
     ADMIN = 'admin'
     SUPER_ADMIN = 'super_admin'
     WHITELIST = 'whitelist'
     BLACKLIST = 'blacklist'
 
+# ============================================================================
+# MAIN ACCESS CONTROL FUNCTIONS
+# ============================================================================
+
 @handle_errors
 @admin_required
 async def handle_access_control(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Display the main access control menu for admins. Handles permission checks and menu rendering."""
+    """
+    Display the main access control menu for administrators.
+    
+    This function serves as the entry point to the access control system,
+    providing administrators with a menu to manage different user categories.
+    It handles permission validation and menu rendering with comprehensive
+    error handling and security logging.
+    
+    Menu Options:
+        - 👑 Manage Super Admins: View and manage super administrator accounts
+        - ⭐ Manage Admins: View and manage regular administrator accounts  
+        - 👀 White List: Manage users with bot access permissions
+        - 🚫 Black List: Manage restricted/banned users
+        - ✳️ Back: Return to previous menu
+    
+    Args:
+        update (Update): Telegram update containing the callback query
+        ctx (ContextTypes.DEFAULT_TYPE): Bot context with user data
+        
+    Security:
+        - Requires admin privileges (@admin_required decorator)
+        - Logs all access attempts for security auditing
+        - Validates callback query structure before processing
+        
+    Error Handling:
+        - Gracefully handles missing callback queries
+        - Logs detailed error information for debugging
+        - Shows user-friendly error messages on failure
+        
+    Returns:
+        None: Function handles response directly through Telegram API
+    """
+    # Validate callback query structure
     q = getattr(update, 'callback_query', None)
     if not q:
+        logger.warning("No callback query found in access control request")
         return
+    
+    # Extract user information for logging and validation
+    telegram_id = getattr(q.from_user, 'id', None)
+    logger.info(f"Access control menu requested by user {telegram_id}")
+    
     try:
+        # Acknowledge the callback query to prevent timeout
         await q.answer()
-        telegram_id = getattr(q.from_user, 'id', None)
+        logger.debug(f"Displaying access control menu for user {telegram_id}")
+        
+        # Create the main access control menu
         buttons = [
             [InlineKeyboardButton("👑 Manage Super Admins", callback_data="manage_super_admins")],
             [InlineKeyboardButton("⭐ Manage Admins", callback_data="manage_admins")],
@@ -91,8 +196,15 @@ async def handle_access_control(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🚫 Black List", callback_data="manage_blacklist")],
             [InlineKeyboardButton("✳️ Back", callback_data="back")]
         ]
+        
+        # Display the menu to the user
         await q.edit_message_text(ACCESS_CONTROL_TITLE, reply_markup=InlineKeyboardMarkup(buttons))
+        logger.debug("Access control menu displayed successfully")
+        
     except Exception as e:
+        # Log detailed error information for debugging
+        logger.error(f"Failed to display access control menu for user {telegram_id}: {str(e)}", exc_info=True)
+        # Show user-friendly error message
         await q.edit_message_text(FAILED_TO_LOAD_ACCESS_CONTROL)
 
 @handle_errors
@@ -222,19 +334,7 @@ async def manage_whitelist(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             label = full_name or username or str(user['telegram_id'])
             if username:
                 label += f" (@{username})"
-            buttons.append([InlineKeyboardButton(label, callback_data="noop")])
-            if user.get('expiration_time'):
-                buttons.append([
-                    InlineKeyboardButton("🗑️ Remove Limit", callback_data=f"remove_limit:{user['telegram_id']}"),
-                    InlineKeyboardButton("♛ Promote", callback_data=f"promote_admin:{user['telegram_id']}"),
-                    InlineKeyboardButton("❌ Remove", callback_data=f"remove_whitelist:{user['telegram_id']}")
-                ])
-            else:
-                buttons.append([
-                    InlineKeyboardButton("⏳ Set Limit", callback_data=f"set_limit:{user['telegram_id']}"),
-                    InlineKeyboardButton("♛ Promote", callback_data=f"promote_admin:{user['telegram_id']}"),
-                    InlineKeyboardButton("❌ Remove", callback_data=f"remove_whitelist:{user['telegram_id']}")
-                ])
+            buttons.append([InlineKeyboardButton(label, callback_data=f"whitelist_select:{user['telegram_id']}")])
         if pagination_buttons:
             buttons.append(pagination_buttons)
         buttons.append([InlineKeyboardButton("✳️ Back", callback_data="back_to_access")])

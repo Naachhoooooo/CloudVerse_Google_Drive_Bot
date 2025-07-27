@@ -1,6 +1,6 @@
 📃 *CloudVerse - Terms of Service and Privacy Policy*
 
-__Last Updated : 13 July, 2025__
+__Last Updated : 25 July, 2025__
 
 *How we manage collected information*
 
@@ -12,7 +12,7 @@ __Last Updated : 13 July, 2025__
 
 *Built for educational purposes*
 
-The Bot is developed strictly for educational, demonstration, and personal learning purposes. It is not yet intended for commercial deployment or production environments.
+Please use the bot service fairly and responsibly, as this is an educational project aiming at learning and innovation, and not for commercial exploitation or abuse.
 
 *Your Acceptance of these terms*
 

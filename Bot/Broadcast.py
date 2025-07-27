@@ -10,6 +10,8 @@ from datetime import datetime
 from .TeamCloudverse import handle_broadcast_request
 from .Utilities import handle_errors, admin_required
 
+from .Logger import admin_logger as logger
+
 NO_PERMISSION_ADMIN_CONTROLS_MSG = "You don't have permission to access Admin Controls."
 BROADCAST_TITLE = "🎙️ Broadcast Message\n\n"
 BROADCAST_TARGET_MSG = "📊 This message will be sent to {user_count} users (whitelisted users excluding admins).\n\n"
@@ -71,6 +73,7 @@ async def handle_broadcast_media_message(update: Update, ctx: ContextTypes.DEFAU
     if not update.message or not update.message.from_user:
         return
     telegram_id = update.message.from_user.id
+    username = update.message.from_user.username
     if not is_admin(telegram_id):
         return
     request_id = str(uuid.uuid4())
@@ -105,7 +108,7 @@ async def handle_broadcast_media_message(update: Update, ctx: ContextTypes.DEFAU
     else:
         await update.message.reply_text(UNSUPPORTED_MEDIA_TYPE_MSG)
         return
-    success = create_broadcast_request(request_id, telegram_id, message_text, media_type, media_file_id, user_count)
+    success = create_broadcast_request(request_id, telegram_id, username, message_text, media_type, media_file_id, user_count)
     if not success:
         await update.message.reply_text(FAILED_TO_CREATE_BROADCAST_REQUEST_MSG)
         return
@@ -254,7 +257,7 @@ async def handle_regular_admin_broadcast_approval(update: Update, ctx: ContextTy
                 if group_message_id and GROUP_CHAT_ID:
                     approver_names = [f"@{approval['username']}" for approval in approvers]
                     text = f"✅ **Broadcast Approved**\n\n"
-                    text += f"👤 **Requester:** @{request['requester_id']}\n"
+                    text += f"👤 **Requester:** @{request['requester_username']}\n"
                     text += f"📊 **Target:** {request['target_count']} users\n"
                     text += f"📝 **Message:** {request['message_text'][:100]}{'...' if len(request['message_text']) > 100 else ''}\n"
                     text += f"✅ **Approved by:** {', '.join(approver_names)}\n"
@@ -288,7 +291,7 @@ async def handle_regular_admin_broadcast_approval(update: Update, ctx: ContextTy
                 ]
                 approver_names = [f"@{approval['username']}" for approval in approvers]
                 text = f"🎙️ **Broadcast Request**\n\n"
-                text += f"👤 **Requester:** @{request['requester_id']}\n"
+                text += f"👤 **Requester:** @{request['requester_username']}\n"
                 text += f"📊 **Target:** {request['target_count']} users\n"
                 text += f"📝 **Message:** {request['message_text']}\n"
                 if request['media_type'] != "text":

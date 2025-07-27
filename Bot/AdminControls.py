@@ -1,7 +1,8 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from .database import (
-    get_whitelisted_users, is_admin, get_admins, get_whitelist, is_super_admin, get_all_users_for_analytics
+    get_whitelisted_users, is_admin, get_admins, get_whitelist, is_super_admin, get_all_users_for_analytics,
+    get_user_quota_info, set_user_quota_limit, get_whitelisted_users_except_admins
 )
 import sqlite3
 from .config import GROUP_CHAT_ID, TeamCloudverse_TOPIC_ID, DB_PATH
@@ -14,6 +15,8 @@ TERMS_MD_PATH = os.path.join(os.path.dirname(__file__), 'TermsAndCondition.md')
 from .Utilities import admin_required
 from .database import get_admins_paginated, get_all_users_for_analytics_paginated
 from .UserState import UserStateEnum
+
+from .Logger import admin_logger as logger
 
 # Message constants (user-facing)
 NO_PERMISSION_ADMIN_CONTROLS_MSG = "You don't have permission to access Admin Controls."
@@ -52,6 +55,7 @@ async def handle_admin_control(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         buttons = [
             [InlineKeyboardButton("👑 Admin", callback_data="admin_list")],
             [InlineKeyboardButton("👥 Users", callback_data="users_list")],
+            [InlineKeyboardButton("🎫 Manage Quota", callback_data="manage_quota")],
             [InlineKeyboardButton("📊 Analytics", callback_data="analytics_report")],
             [InlineKeyboardButton("🖥 Performance", callback_data="performance_panel")],
             [InlineKeyboardButton("🗑️ Delete Records", callback_data="delete_records")],
@@ -556,6 +560,226 @@ async def handle_new_domain_message(update: Update, ctx: ContextTypes.DEFAULT_TY
     ctx.user_data["awaiting_new_domain"] = False
     # Show the updated list
     await handle_modify_allowed_domain(update, ctx)
+
+# Quota Management Functions
+
+@admin_required
+@handle_errors
+async def handle_manage_quota(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle quota management - show list of regular users"""
+    if ctx.user_data is None:
+        ctx.user_data = {}
+    
+    q = update.callback_query
+    if not q or not q.from_user:
+        return
+    
+    data = getattr(q, 'data', None)
+    current_page = ctx.user_data.get("quota_page", 0)
+    
+    # Handle pagination
+    if data == "quota_prev_page":
+        ctx.user_data["quota_page"] = max(0, current_page - 1)
+    elif data == "quota_next_page":
+        ctx.user_data["quota_page"] = current_page + 1
+    
+    page = ctx.user_data.get("quota_page", 0)
+    
+    # Get regular users (whitelisted users excluding admins)
+    regular_users = get_whitelisted_users_except_admins()
+    
+    if not regular_users:
+        text = "🎫 <b>Manage Quota</b>\n\nNo regular users found."
+        buttons = [
+            [InlineKeyboardButton(REFRESH_BUTTON, callback_data="manage_quota")],
+            [InlineKeyboardButton(BACK_BUTTON, callback_data="admin_control")]
+        ]
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+        return
+    
+    # Pagination
+    from .Utilities import pagination
+    page_users, total_pages, start_idx, end_idx, pagination_buttons = pagination(
+        regular_users, page, DEFAULT_PAGE_SIZE, "quota_prev_page", "quota_next_page"
+    )
+    
+    text = f"🎫 <b>Manage Quota</b> ({len(regular_users)} users)\n\n"
+    text += "Select a user to manage their quota:\n\n"
+    
+    # Create user buttons
+    buttons = []
+    for user in page_users:
+        user_id = user['telegram_id']
+        username = user['username'] or 'N/A'
+        name = user['name'] or 'N/A'
+        display_name = f"@{username}" if username != 'N/A' else name
+        buttons.append([InlineKeyboardButton(
+            f"{display_name} ({user_id})", 
+            callback_data=f"quota_user:{user_id}"
+        )])
+    
+    # Add pagination if needed
+    if pagination_buttons:
+        buttons.append(pagination_buttons)
+    
+    # Add control buttons
+    buttons.extend([
+        [InlineKeyboardButton(REFRESH_BUTTON, callback_data="manage_quota")],
+        [InlineKeyboardButton(BACK_BUTTON, callback_data="admin_control")]
+    ])
+    
+    await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+@admin_required
+@handle_errors
+async def handle_quota_user_details(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show quota details for a specific user"""
+    if ctx.user_data is None:
+        ctx.user_data = {}
+    
+    q = update.callback_query
+    if not q or not q.from_user:
+        return
+    
+    # Extract user ID from callback data
+    user_id = q.data.split(":", 1)[1]
+    
+    # Get user information
+    regular_users = get_whitelisted_users_except_admins()
+    user_info = next((user for user in regular_users if user['telegram_id'] == user_id), None)
+    
+    if not user_info:
+        await q.edit_message_text(
+            "❌ User not found or no longer a regular user.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(BACK_BUTTON, callback_data="manage_quota")]])
+        )
+        return
+    
+    # Get quota information
+    quota_info = get_user_quota_info(user_id)
+    
+    # Format user details
+    username = user_info['username'] or 'N/A'
+    name = user_info['name'] or 'N/A'
+    display_name = f"@{username}" if username != 'N/A' else name
+    
+    # Get joined timestamp (from whitelisted_users table)
+    try:
+        with sqlite3.connect(str(DB_PATH), timeout=20.0) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT approved_at FROM whitelisted_users WHERE telegram_id = ?", (user_id,))
+            result = cursor.fetchone()
+            joined_timestamp = result[0] if result and result[0] else "Unknown"
+    except Exception:
+        joined_timestamp = "Unknown"
+    
+    text = (
+        f"🎫 <b>User Quota Management</b>\n\n"
+        f"<b>User Details:</b>\n"
+        f"Name: {name}\n"
+        f"Username: {display_name}\n"
+        f"Telegram ID: <code>{user_id}</code>\n"
+        f"Joined: {joined_timestamp}\n\n"
+        f"<b>Current Quota Settings:</b>\n"
+        f"Daily Upload Limit: <b>{quota_info['daily_limit']}</b>\n"
+        f"Used Today: <b>{quota_info['daily_used']}</b>\n"
+        f"Remaining: <b>{quota_info['daily_limit'] - quota_info['daily_used']}</b>\n"
+        f"Last Reset: {quota_info['last_reset_time']}\n"
+    )
+    
+    buttons = [
+        [InlineKeyboardButton("✏️ Edit Quota", callback_data=f"edit_quota:{user_id}")],
+        [InlineKeyboardButton(BACK_BUTTON, callback_data="manage_quota")]
+    ]
+    
+    await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+@admin_required
+@handle_errors
+async def handle_edit_quota(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle quota editing"""
+    if ctx.user_data is None:
+        ctx.user_data = {}
+    
+    q = update.callback_query
+    if not q or not q.from_user:
+        return
+    
+    # Extract user ID from callback data
+    user_id = q.data.split(":", 1)[1]
+    
+    # Store user ID for later use
+    ctx.user_data["editing_quota_user_id"] = user_id
+    ctx.user_data["awaiting_quota_input"] = True
+    
+    text = (
+        f"✏️ <b>Edit Quota Limit</b>\n\n"
+        f"Enter the new daily upload limit for user <code>{user_id}</code>:\n\n"
+        f"<i>Current limit: {get_user_quota_info(user_id)['daily_limit']}</i>\n\n"
+        f"Send a number (e.g., 5, 10, 20) or 0 for unlimited."
+    )
+    
+    buttons = [
+        [InlineKeyboardButton("Cancel", callback_data=f"quota_user:{user_id}")]
+    ]
+    
+    await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+@admin_required
+@handle_errors
+async def handle_quota_input_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle quota limit input from admin"""
+    if ctx.user_data is None:
+        ctx.user_data = {}
+    
+    if not ctx.user_data.get("awaiting_quota_input"):
+        return
+    
+    user_id = ctx.user_data.get("editing_quota_user_id")
+    if not user_id:
+        await update.message.reply_text("❌ No user selected for quota editing.")
+        return
+    
+    try:
+        new_limit = int(update.message.text.strip())
+        if new_limit < 0:
+            raise ValueError("Limit cannot be negative")
+        
+        # Set the new quota limit
+        success = set_user_quota_limit(user_id, new_limit)
+        
+        if success:
+            limit_text = "unlimited" if new_limit == 0 else str(new_limit)
+            await update.message.reply_text(
+                f"✅ Quota limit updated successfully!\n\n"
+                f"User <code>{user_id}</code> now has a daily limit of <b>{limit_text}</b> uploads.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("View User", callback_data=f"quota_user:{user_id}"),
+                    InlineKeyboardButton("Back to List", callback_data="manage_quota")
+                ]])
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Failed to update quota limit. Please try again.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Try Again", callback_data=f"edit_quota:{user_id}"),
+                    InlineKeyboardButton("Back", callback_data=f"quota_user:{user_id}")
+                ]])
+            )
+    
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Invalid input. Please enter a valid number (0 or positive integer).",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Try Again", callback_data=f"edit_quota:{user_id}"),
+                InlineKeyboardButton("Back", callback_data=f"quota_user:{user_id}")
+            ]])
+        )
+    
+    # Clear the awaiting state
+    ctx.user_data["awaiting_quota_input"] = False
+    ctx.user_data.pop("editing_quota_user_id", None)
 
 # Register new handlers in your dispatcher as needed:
 # dispatcher.add_handler(CallbackQueryHandler(handle_modify_allowed_domain, pattern="^modify_allowed_domain$"))

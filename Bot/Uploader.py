@@ -14,10 +14,12 @@ import math
 from telethon import TelegramClient
 from telethon.tl.types import InputDocument
 from .config import TELETHON_API_ID, TELETHON_API_HASH
-from .database import insert_upload, get_upload_by_file_id, get_user_default_folder_id
+from .database import insert_upload, get_upload_by_file_id, get_user_default_folder_id, check_user_quota_limit, increment_user_quota
 import subprocess
 import shlex
 from .Utilities import format_size, is_url, handle_errors, get_adaptive_chunk_size, is_streaming_site, is_direct_file_url
+
+from .Logger import upload_logger as logger
 
 # Message constants (user-facing)
 COULD_NOT_FIND_MESSAGE_ID_OR_CHAT_ID_MSG = '❌ Could not find message_id or chat_id for this file. Large file download not possible.'
@@ -84,17 +86,35 @@ async def download_from_telegram(telegram_id, file_id, file_size, file_name, upd
 
 @handle_errors
 async def handle_file_upload(update, ctx):
+    """Handle file upload from Telegram to Google Drive"""
     telegram_id = None
     preparing_message = None
     temp_file_path = None
     file_mime_type = None
     file_name_to_use = None
+    
+    logger.info("Starting file upload process")
     try:
         if update.message and update.message.from_user:
             telegram_id = update.message.from_user.id
         elif update.callback_query and update.callback_query.from_user:
             telegram_id = update.callback_query.from_user.id
         else:
+            logger.warning("No valid user found in update")
+            return
+        
+        logger.info(f"File upload initiated by user {telegram_id}")
+        
+        # Check quota limit before proceeding with upload
+        logger.debug(f"Checking quota limit for user {telegram_id}")
+        if not check_user_quota_limit(telegram_id):
+            logger.warning(f"User {telegram_id} exceeded daily upload quota")
+            await update.message.reply_text(
+                "❌ <b>Daily Upload Quota Exceeded</b>\n\n"
+                "You have reached your daily upload limit. Please try again tomorrow or contact an admin for assistance.\n\n"
+                "Check your quota status in Account Profile.",
+                parse_mode='HTML'
+            )
             return
         if update.message and update.message.document:
             file = update.message.document
@@ -301,6 +321,8 @@ async def handle_file_upload(update, ctx):
                     logger.info(f"User {telegram_id} uploaded file '{uploaded_file['name']}' successfully. Size: {file_size_bytes} bytes.")
                     # After successful upload, log upload with message_id and chat_id
                     insert_upload(telegram_id, getattr(file, 'file_id', None), getattr(file, 'file_name', None), file_size_bytes, getattr(file, 'mime_type', None), message_id, chat_id, status='success', error_message=None)
+                    # Increment user's daily quota count
+                    increment_user_quota(telegram_id)
         except Exception as e:
             if preparing_message:
                 await preparing_message.edit_text(ERROR(str(e)))
@@ -342,6 +364,16 @@ async def handle_url_upload(update, ctx):
     if update.message and update.message.from_user:
         telegram_id = update.message.from_user.id
     else:
+        return
+    
+    # Check quota limit before proceeding with URL upload
+    if not check_user_quota_limit(telegram_id):
+        await update.message.reply_text(
+            "❌ <b>Daily Upload Quota Exceeded</b>\n\n"
+            "You have reached your daily upload limit. Please try again tomorrow or contact an admin for assistance.\n\n"
+            "Check your quota status in Account Profile.",
+            parse_mode='HTML'
+        )
         return
     if ctx.user_data is None:
         ctx.user_data = {}
@@ -504,6 +536,8 @@ async def handle_url_upload(update, ctx):
     file_size_gb = file_size_bytes / (1024 ** 3) if file_size_bytes else 0
     if 'uploaded_file' in locals() and uploaded_file:
         logger.info(f"User {telegram_id} uploaded file '{uploaded_file['name']}' successfully. Size: {file_size_bytes} bytes.")
+        # Increment user's daily quota count for URL uploads
+        increment_user_quota(telegram_id)
 
 @handle_errors
 async def cancel_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):

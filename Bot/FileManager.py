@@ -11,6 +11,9 @@ from typing import Any
 from .UserState import UserStateEnum
 import googleapiclient.discovery
 
+from .Logger import get_logger
+logger = get_logger(__name__)
+
 DEFAULT_PAGE_SIZE = 10
 
 # Message constants (user-facing)
@@ -145,7 +148,7 @@ async def handle_folder_navigation(update: Update, ctx: ContextTypes.DEFAULT_TYP
             if ctx.user_data.get("in_def_location"):
                 conn = sqlite3.connect(str(DB_PATH))
                 cursor = conn.cursor()
-                cursor.execute("UPDATE users SET default_folder_id = ? WHERE telegram_id = ? AND account_email = ?", 
+                cursor.execute("UPDATE user_credentials SET default_upload_location = ? WHERE telegram_id = ? AND email_address_1 = ?", 
                                (folder_id, telegram_id, current_account))
                 conn.commit()
                 conn.close()

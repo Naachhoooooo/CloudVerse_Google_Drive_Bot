@@ -9,6 +9,9 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfbase import pdfmetrics
 from reportlab.lib.fonts import addMapping
 from typing import Any
+
+from .Logger import get_logger
+logger = get_logger(__name__)
 DEFAULT_PAGE_SIZE = 10
 
 pdfmetrics.registerFont(TTFont('Helvetica', 'Utilities/Helvetica.ttf'))

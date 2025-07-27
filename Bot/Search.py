@@ -4,6 +4,9 @@ from .drive import search_files
 import asyncio
 from typing import Any
 from .Utilities import pagination, handle_errors
+
+from .Logger import get_logger
+logger = get_logger(__name__)
 DEFAULT_PAGE_SIZE = 10  # Configurable default page size for pagination
 
 # Message constants (user-facing)

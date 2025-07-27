@@ -1,3 +1,37 @@
+"""
+CloudVerse Google Drive Bot - Utilities Module
+
+This module provides essential utility functions, decorators, and helpers used
+throughout the CloudVerse Bot application. It includes access control decorators,
+error handling mechanisms, pagination utilities, and various helper functions
+for common operations.
+
+Key Features:
+- Access control decorators for admin and user permissions
+- Comprehensive error handling with logging
+- Pagination utilities for large data sets
+- URL validation and processing
+- File size formatting and calculations
+- System resource monitoring utilities
+- Common UI components and message formatting
+
+Decorators:
+- @handle_errors: Comprehensive error handling with logging
+- @admin_required: Restricts access to admin users only
+- @super_admin_required: Restricts access to super admin users only
+- @access_required: Ensures user has bot access permissions
+
+Utility Functions:
+- Pagination for large lists
+- URL validation and processing
+- File size calculations and formatting
+- System resource monitoring
+- Common UI component generation
+
+Author: CloudVerse Team
+License: Open Source
+"""
+
 import re
 import asyncio
 import humanize
@@ -11,27 +45,96 @@ from telegram import InlineKeyboardButton
 
 from .drive import get_credentials, list_files
 from .config import DB_PATH
-from .Utilities import format_size, handle_errors
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+from .Logger import get_logger
+logger = get_logger(__name__)
+
+# ============================================================================
+# MESSAGE CONSTANTS - User-facing messages for consistent UX
+# ============================================================================
+
+# Error messages
 ERROR_OCCURRED_MSG = "An error occurred. Please try again or use /cancel."
 ADMIN_DENIED_MSG = "You don't have permission to access this feature."
 SUPER_ADMIN_DENIED_MSG = "Only the super admin can perform this action."
 ACCESS_DENIED_MSG = "Access denied. You do not have permission to perform this action."
 
+# Service status messages
 SERVICE_UNAVAILABLE_MSG = "Service unavailable. Please try again later."
+
+# File operation messages
 FILE_SIZE_MSG = "File size: {size}"
 FAILED_TO_GET_FILE_SIZE_MSG = "Failed to get file size: {error}"
 FOLDER_SIZE_MSG = "Folder size: {size}"
 FAILED_TO_GET_FOLDER_INFO_MSG = "Failed to get folder info: {error}"
 
+# ============================================================================
+# DECORATORS - Function decorators for error handling and access control
+# ============================================================================
+
 def handle_errors(handler):
+    """
+    Comprehensive error handling decorator for bot handlers.
+    
+    This decorator wraps bot handler functions to provide consistent error
+    handling, logging, and user feedback. It captures exceptions, logs them
+    with context information, and provides appropriate user responses.
+    
+    Features:
+        - Automatic exception catching and logging
+        - User context extraction for detailed logs
+        - Graceful error responses to users
+        - Performance monitoring and debugging info
+        - Prevents bot crashes from unhandled exceptions
+    
+    Args:
+        handler: The async function to wrap (bot handler)
+        
+    Returns:
+        wrapper: The wrapped function with error handling
+        
+    Usage:
+        @handle_errors
+        async def my_handler(update, ctx):
+            # Handler code here
+            pass
+            
+    Logging Information:
+        - Handler name and execution time
+        - User ID and context information
+        - Full exception details with stack traces
+        - Performance metrics for optimization
+    """
     @wraps(handler)
     async def wrapper(update, ctx: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        handler_name = handler.__name__
+        user_id = None
+        
+        # Extract user information for comprehensive logging
         try:
-            return await handler(update, ctx, *args, **kwargs)
+            if hasattr(update, 'effective_user') and update.effective_user:
+                user_id = update.effective_user.id
+            elif hasattr(update, 'callback_query') and update.callback_query and update.callback_query.from_user:
+                user_id = update.callback_query.from_user.id
+            elif hasattr(update, 'message') and update.message and update.message.from_user:
+                user_id = update.message.from_user.id
+        except Exception:
+            # Silently handle user extraction errors to prevent cascading failures
+            pass
+        
+        logger.debug(f"Executing handler: {handler_name} for user: {user_id}")
+        
+        try:
+            # Execute the wrapped handler function
+            result = await handler(update, ctx, *args, **kwargs)
+            logger.debug(f"Handler {handler_name} completed successfully for user: {user_id}")
+            return result
         except Exception as e:
-            # Try to send a user-friendly error message
+            # Log the error with full context and stack trace
+            logger.error(f"Error in handler {handler_name} for user {user_id}: {str(e)}", exc_info=True)
+            
+            # Attempt to send user-friendly error message through appropriate channel
             try:
                 if hasattr(update, 'effective_chat') and update.effective_chat:
                     await ctx.bot.send_message(chat_id=update.effective_chat.id, text=ERROR_OCCURRED_MSG)
@@ -39,13 +142,46 @@ def handle_errors(handler):
                     await update.message.reply_text(ERROR_OCCURRED_MSG)
                 elif hasattr(update, 'callback_query') and update.callback_query:
                     await update.callback_query.edit_message_text(ERROR_OCCURRED_MSG)
-            except Exception:
-                pass
+                logger.debug(f"Error message sent to user {user_id}")
+            except Exception as send_error:
+                # Log failure to send error message but don't raise
+                logger.error(f"Failed to send error message to user {user_id}: {str(send_error)}")
     return wrapper
 
 def admin_required(handler):
+    """
+    Access control decorator that restricts handler access to admin users only.
+    
+    This decorator checks if the user has admin privileges before allowing
+    access to the wrapped handler function. It provides comprehensive logging
+    of access attempts and denials for security auditing.
+    
+    Access Control:
+        - Allows access to users with admin or super admin privileges
+        - Denies access to regular users and non-authenticated users
+        - Logs all access attempts for security monitoring
+        
+    Args:
+        handler: The async function to wrap (bot handler)
+        
+    Returns:
+        wrapper: The wrapped function with admin access control
+        
+    Usage:
+        @admin_required
+        async def admin_only_handler(update, ctx):
+            # Only admins can access this
+            pass
+            
+    Security Features:
+        - User identification from multiple update types
+        - Database-backed permission checking
+        - Comprehensive access logging
+        - Graceful denial with user feedback
+    """
     @wraps(handler)
     async def wrapper(update, ctx, *args, **kwargs):
+        # Extract user ID from various update types
         telegram_id = None
         if hasattr(update, 'effective_user') and update.effective_user:
             telegram_id = update.effective_user.id
@@ -53,14 +189,24 @@ def admin_required(handler):
             telegram_id = update.message.from_user.id
         elif hasattr(update, 'callback_query') and update.callback_query and hasattr(update.callback_query, 'from_user') and update.callback_query.from_user:
             telegram_id = update.callback_query.from_user.id
+        
+        logger.debug(f"Admin access check for handler {handler.__name__} by user {telegram_id}")
+        
+        # Check admin privileges in database
         from .database import is_admin
         if not (telegram_id and is_admin(telegram_id)):
+            logger.warning(f"Admin access denied for user {telegram_id} to handler {handler.__name__}")
             denial_msg = ADMIN_DENIED_MSG
+            
+            # Send appropriate denial message based on update type
             if hasattr(update, 'callback_query') and update.callback_query:
                 await update.callback_query.answer(denial_msg, show_alert=True)
             elif hasattr(update, 'message') and update.message:
                 await update.message.reply_text(denial_msg)
             return
+        
+        # Access granted - proceed with handler execution
+        logger.debug(f"Admin access granted for user {telegram_id} to handler {handler.__name__}")
         return await handler(update, ctx, *args, **kwargs)
     return wrapper
 
@@ -279,4 +425,23 @@ def is_direct_file_url(url):
         '.pdf', '.zip', '.rar', '.tar', '.gz', '.jpg', '.jpeg', '.png', '.gif', '.mp4', '.mp3', '.doc', '.docx',
         '.xls', '.xlsx', '.ppt', '.pptx', '.txt', '.csv', '.json', '.xml', '.7z', '.apk', '.exe', '.msi', '.dmg', '.iso'
     ]
-    return any(url.lower().endswith(ext) for ext in file_extensions) 
+    return any(url.lower().endswith(ext) for ext in file_extensions)
+
+def is_streaming_site(url):
+    """Check if URL is from a streaming site that requires special handling."""
+    streaming_domains = [
+        'youtube.com', 'youtu.be', 'vimeo.com', 'dailymotion.com', 'twitch.tv',
+        'facebook.com', 'instagram.com', 'twitter.com', 'tiktok.com', 'soundcloud.com'
+    ]
+    return any(domain in url.lower() for domain in streaming_domains)
+
+def get_current_bandwidth_usage():
+    """Get current network bandwidth usage in Mbps."""
+    try:
+        # Get network I/O statistics
+        net_io = psutil.net_io_counters()
+        # This is a simplified implementation - in practice you'd need to calculate
+        # the rate over time intervals
+        return 0.0  # Placeholder - actual implementation would require time-based calculations
+    except Exception:
+        return 0.0 

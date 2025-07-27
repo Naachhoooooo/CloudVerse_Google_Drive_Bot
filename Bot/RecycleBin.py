@@ -3,6 +3,9 @@ from telegram.ext import ContextTypes
 from .drive import get_drive_service, list_trashed_files, empty_trash, restore_file
 from typing import Any
 from .Utilities import paginate_list
+
+from .Logger import get_logger
+logger = get_logger(__name__)
 DEFAULT_PAGE_SIZE = 10  # Configurable default page size for pagination
 
 # Message constants (user-facing)

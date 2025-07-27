@@ -3,9 +3,10 @@ from telegram.ext import ContextTypes
 from .database import is_admin
 from .AccessControl import handle_access_control
 from .TermsAndCondition import show_terms_and_conditions
-import logging
 from .UserState import UserStateEnum
 from .Utilities import handle_errors
+
+from .Logger import telegram_logger as logger
 
 # Message constants (user-facing)
 MAIN_MENU_TITLE = "Welcome to the Main Menu"
@@ -21,10 +22,13 @@ BACK_BUTTON = "✳️ Back"
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Display the main menu with navigation buttons for all major bot features."""
+    logger.info("Main menu start function called")
     try:
         if update.effective_user and hasattr(update.effective_user, 'id'):
             telegram_id = update.effective_user.id
+            logger.info(f"Displaying main menu for user {telegram_id}")
         else:
+            logger.warning("No effective user found in start function")
             return
         buttons = [
             [InlineKeyboardButton("📁 File Manager", callback_data="FILE_MGR"), InlineKeyboardButton("🔍 Search", callback_data="SEARCH")],
@@ -62,11 +66,12 @@ async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.answer()
         cmd = q.data if q and hasattr(q, 'data') else getattr(update, 'data', None)
         from .FileManager import handle_file_manager
-        from .AccountProfile import handle_profile
+        from .AccountProfile import handle_profile, handle_refresh_profile
         from .StorageDetails import handle_storage
         from .RecycleBin import handle_bin
         from .Settings import handle_settings
         from .MessageForDeveloper import handle_cloudverse_support
+        from .AdminControls import handle_admin_control
 
         async def handle_search(u, c):
             # Activate inline mode with instructions and a back button
@@ -88,6 +93,8 @@ async def handle_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "TEAM_CLOUDVERSE": handle_cloudverse_support,
             "TERMS": show_terms_and_conditions,
             "ACCESS": handle_access_control,
+            "ADMIN_CONTROL": handle_admin_control,
+            "refresh_profile": handle_refresh_profile,
             "back": start,
             "cancel": start
         }
